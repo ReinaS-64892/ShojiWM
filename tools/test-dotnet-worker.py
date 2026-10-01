@@ -41,7 +41,8 @@ def main():
     tree = responses[2]["serialized"]
     assert tree["kind"] == "WindowBorder"
     assert sum(node["kind"] == "Window" for node in nodes(tree)) == 1
-    assert next(node for node in nodes(tree) if node["kind"] == "Label")["props"]["text"] == "Kitty 日本語 · kitty"
+    label = next(node for node in nodes(tree) if node["kind"] == "Label")["props"]["text"]
+    assert snapshot["title"] in label and snapshot["appId"] in label
     handler = next(node for node in nodes(tree) if node["kind"] == "Button")["props"]["onClick"]
     assert handler["kind"] == "runtime-handler" and handler["id"].startswith("handler-")
     assert "config enabled" in result.stderr

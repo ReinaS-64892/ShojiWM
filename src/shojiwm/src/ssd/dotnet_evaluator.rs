@@ -20,6 +20,8 @@ pub struct DotNetDecorationEvaluator {
     executable: PathBuf,
     config: PathBuf,
     state: Arc<Mutex<RuntimeState>>,
+    // Drops after the state/worker, so no mapped config file is removed early.
+    generation: Option<Arc<super::dotnet_reload::GenerationDirectory>>,
 }
 
 #[derive(Debug, Default)]
@@ -67,11 +69,110 @@ impl Drop for RuntimeState {
 }
 
 impl DotNetDecorationEvaluator {
+    #[cfg(test)]
+    pub(super) fn test_process_id(&self) -> Option<u32> {
+        self.state
+            .lock()
+            .unwrap()
+            .transport
+            .as_ref()
+            .map(ExternalTransport::process_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_generation_path(&self) -> Option<PathBuf> {
+        self.generation
+            .as_ref()
+            .map(|directory| directory.path().to_path_buf())
+    }
     pub fn new(executable: PathBuf, config: PathBuf) -> Self {
         Self {
             executable,
             config,
             state: Arc::new(Mutex::new(RuntimeState::default())),
+            generation: None,
+        }
+    }
+
+    pub fn new_shadowed(executable: PathBuf, config: PathBuf) -> Self {
+        match super::dotnet_reload::GenerationDirectory::copy_config(&config) {
+            Ok((directory, staged)) => Self::for_generation(executable, staged, directory),
+            Err(error) => {
+                let evaluator = Self::new(executable, config);
+                if let Ok(mut state) = evaluator.state.lock() {
+                    state.failure = Some(error);
+                }
+                evaluator
+            }
+        }
+    }
+
+    pub(super) fn for_generation(
+        executable: PathBuf,
+        config: PathBuf,
+        directory: Arc<super::dotnet_reload::GenerationDirectory>,
+    ) -> Self {
+        let mut evaluator = Self::new(executable, config);
+        evaluator.generation = Some(directory);
+        evaluator
+    }
+
+    pub(crate) fn copy_environment_to(&self, next: &Self) -> Result<(), DecorationEvaluationError> {
+        let state = self.lock()?;
+        next.set_display_state(state.displays.clone());
+        next.set_input_state(state.inputs.clone());
+        Ok(())
+    }
+
+    pub(super) fn window_snapshots(
+        &self,
+    ) -> Result<Vec<WaylandWindowSnapshot>, DecorationEvaluationError> {
+        Ok(self
+            .lock()?
+            .windows
+            .values()
+            .map(|(snapshot, _)| snapshot.clone())
+            .collect())
+    }
+
+    /// Retire all evaluator clones at commit, with bounded cleanup even when
+    /// user OnDisable throws or stalls. Process death clears timers/statics.
+    pub(crate) fn retire(&self, reason: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(mut transport) = state.transport.take() {
+                let request = ExternalRuntimeRequest {
+                    request_id: state.next_request_id.saturating_add(1),
+                    kind: "lifecycleDisable",
+                    snapshot: None,
+                    window_id: None,
+                    handler_id: None,
+                    now_ms: 0,
+                    reason: Some(reason),
+                    display_state: &state.displays,
+                    input_state: &state.inputs,
+                };
+                if let Ok(bytes) = serde_json::to_vec(&request) {
+                    match transport.exchange(bytes, std::time::Duration::from_millis(100)) {
+                        Ok(bytes) => {
+                            match serde_json::from_slice::<ExternalRuntimeResponse>(&bytes) {
+                                Ok(response) if response.ok => {}
+                                Ok(response) => {
+                                    tracing::warn!(error = ?response.error, "C# disable callback failed; terminating worker")
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "invalid C# disable response; terminating worker")
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "C# generation cleanup failed; terminating worker")
+                        }
+                    }
+                }
+                transport.stop();
+            }
+            state.windows.clear();
+            state.failure = Some("runtime generation retired".into());
         }
     }
 

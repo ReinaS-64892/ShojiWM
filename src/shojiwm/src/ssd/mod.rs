@@ -11,6 +11,7 @@
 
 mod bridge;
 mod dotnet_evaluator;
+pub(crate) mod dotnet_reload;
 mod embedded_runtime;
 mod evaluator;
 mod external_protocol;

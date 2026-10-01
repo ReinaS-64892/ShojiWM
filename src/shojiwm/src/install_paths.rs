@@ -12,6 +12,7 @@ pub struct RuntimePathOptions {
     pub config_path: Option<PathBuf>,
     pub runtime_dir: Option<PathBuf>,
     pub decoration_runtime: Option<PathBuf>,
+    pub dotnet_project: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -26,6 +27,10 @@ pub fn runtime_backend_kind() -> RuntimeBackendKind {
         .get()
         .map(|options| options.backend)
         .unwrap_or_default()
+}
+
+pub fn runtime_path_options() -> RuntimePathOptions {
+    RUNTIME_PATH_OPTIONS.get().cloned().unwrap_or_default()
 }
 
 /// .NET uses the existing CLI paths, without the TypeScript project discovery.

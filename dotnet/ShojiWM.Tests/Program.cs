@@ -179,6 +179,19 @@ Test("lifecycle enable/disable called exactly once per generation", () =>
     Check(config.Enables == 1 && config.Disables == 1);
 });
 
+Test("handler IDs do not cross runtime generations", () =>
+{
+    using var oldSession = new RuntimeSession(new HandlerConfig());
+    using var nextSession = new RuntimeSession(new HandlerConfig());
+    var oldTree = oldSession.Handle(Request("evaluate", window: snapshot)).Serialized!;
+    var nextTree = nextSession.Handle(Request("evaluate", window: snapshot)).Serialized!;
+    var oldHandler = Nodes(oldTree).Single(node => node.Kind == "Button").Props.OnClick!.Handler!.Id;
+    var nextHandler = Nodes(nextTree).Single(node => node.Kind == "Button").Props.OnClick!.Handler!.Id;
+    Check(oldHandler != nextHandler);
+    Check(nextSession.Handle(Request("invokeHandler", handler: oldHandler)).Invoked == false);
+    Check(nextSession.Handle(Request("invokeHandler", handler: nextHandler)).Invoked == true);
+});
+
 Console.WriteLine($"{passed} tests passed");
 
 sealed class LifecycleConfig : IWindowConfig

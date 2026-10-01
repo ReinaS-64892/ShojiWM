@@ -1,5 +1,6 @@
 //! Bounded synchronous exchanges over NDJSON. Pipe I/O runs off the compositor
 //! thread so a worker that stops reading stdin cannot defeat the deadline.
+use std::os::unix::process::CommandExt;
 use std::{
     io::{BufRead, BufReader, Read, Write},
     path::Path,
@@ -20,6 +21,10 @@ pub struct ExternalTransport {
 }
 
 impl ExternalTransport {
+    #[cfg(test)]
+    pub(super) fn process_id(&self) -> u32 {
+        self.child.id()
+    }
     pub fn start(executable: &Path, config: &Path) -> Result<Self, String> {
         let mut command = Command::new(executable);
         command.arg("--config").arg(config);
@@ -27,6 +32,7 @@ impl ExternalTransport {
     }
 
     pub(super) fn spawn(mut command: Command) -> Result<Self, String> {
+        command.process_group(0);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -70,8 +76,7 @@ impl ExternalTransport {
                 }
             });
         if let Err(error) = thread {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child(&mut child);
             return Err(error.to_string());
         }
         Ok(Self {
@@ -84,7 +89,7 @@ impl ExternalTransport {
 
     pub fn exchange(&mut self, request: Vec<u8>, timeout: Duration) -> Result<Vec<u8>, String> {
         if self.failed {
-            return Err("external runtime is unavailable; restart ShojiWM to retry".into());
+            return Err("external runtime is unavailable; reload the config to retry".into());
         }
         if request.len() >= MAX_FRAME_BYTES {
             return Err("external runtime request exceeds frame limit".into());
@@ -107,11 +112,28 @@ impl ExternalTransport {
     }
 
     pub fn stop(&mut self) {
+        if self.failed {
+            return;
+        }
         self.failed = true;
         self.requests.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        terminate_child(&mut self.child);
     }
+}
+
+/// Only target a process group created for our own child. This also retires
+/// compiler/user child processes that have not explicitly detached themselves.
+pub(super) fn terminate_child(child: &mut Child) {
+    // Callers invoke this exactly once, before reaping the child. Until wait,
+    // its pid cannot be reused even if the worker has already exited.
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl Drop for ExternalTransport {

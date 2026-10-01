@@ -188,6 +188,7 @@ struct CliArgs {
     config_path: Option<PathBuf>,
     runtime_dir: Option<PathBuf>,
     decoration_runtime: Option<PathBuf>,
+    dotnet_project: Option<PathBuf>,
 }
 
 impl CliArgs {
@@ -238,6 +239,7 @@ impl CliArgs {
             config_path,
             runtime_dir,
             decoration_runtime,
+            dotnet_project: parse_option_value(&args, "--dotnet-project").map(PathBuf::from),
         }
     }
 }
@@ -249,6 +251,7 @@ fn init_runtime_paths(args: &CliArgs) {
         config_path: args.config_path.clone(),
         runtime_dir: args.runtime_dir.clone(),
         decoration_runtime: args.decoration_runtime.clone(),
+        dotnet_project: args.dotnet_project.clone(),
     });
 }
 

@@ -11,6 +11,7 @@ public sealed class RuntimeSession(IWindowConfig config) : IDisposable
     private readonly Dictionary<string, WindowEntry> windows = [];
     private readonly List<RuntimeWindowAction> actions = [];
     private ulong nextHandlerId;
+    private readonly string generationId = Guid.NewGuid().ToString("N");
     private bool enabled;
 
     public ExternalRuntimeResponse HandleJson(string json)
@@ -100,7 +101,7 @@ public sealed class RuntimeSession(IWindowConfig config) : IDisposable
         var tree = composition.ToWire((key, callback) =>
         {
             var id = previous is not null && previous.Handlers.TryGetValue(key, out var prior)
-                ? prior.Id : $"handler-{checked(++nextHandlerId)}";
+                ? prior.Id : $"handler-{generationId}-{checked(++nextHandlerId)}";
             handlers.Add(key, (id, callback));
             return id;
         });

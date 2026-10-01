@@ -443,6 +443,7 @@ pub struct ShojiWM {
     pub layer_effect_evaluation_cache: HashMap<String, crate::ssd::EffectEvaluationCacheEntry>,
     pub popup_effect_evaluation_cache: HashMap<String, crate::ssd::EffectEvaluationCacheEntry>,
     pub config_error_report: Option<crate::config_error::ConfigErrorReport>,
+    dotnet_reload_manager: Option<crate::ssd::dotnet_reload::DotNetReloadManager>,
     pub layer_backdrop_cache: HashMap<String, crate::backend::shader_effect::CachedBackdropTexture>,
     pub layer_framebuffer_effect_states:
         HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
@@ -1541,7 +1542,7 @@ impl ShojiWM {
             }
             crate::install_paths::RuntimeBackendKind::DotNet => {
                 let (executable, config) = crate::install_paths::dotnet_runtime_paths();
-                DecorationRuntimeEvaluator::DotNet(crate::ssd::DotNetDecorationEvaluator::new(
+                DecorationRuntimeEvaluator::DotNet(crate::ssd::DotNetDecorationEvaluator::new_shadowed(
                     executable, config,
                 ))
             }
@@ -1553,6 +1554,56 @@ impl ShojiWM {
                 Some(crate::config_error::ConfigErrorReport::initial_load(error))
             }
         };
+        let dotnet_reload_manager =
+            if let DecorationRuntimeEvaluator::DotNet(current) = &decoration_evaluator {
+                let paths = crate::install_paths::runtime_path_options();
+                let (executable, config) = crate::install_paths::dotnet_runtime_paths();
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let config = cwd.join(config);
+                let project = paths.dotnet_project.map(|project| cwd.join(project));
+                let watch_root = paths
+                    .runtime_dir
+                    .map(|dir| cwd.join(dir))
+                    .unwrap_or_else(|| {
+                        let parent = project
+                            .as_ref()
+                            .and_then(|path| path.parent())
+                            .unwrap_or_else(|| config.parent().unwrap_or(&cwd));
+                        parent
+                            .ancestors()
+                            .find(|dir| dir.join("Directory.Build.props").is_file())
+                            .unwrap_or(parent)
+                            .to_path_buf()
+                    });
+                let (tx, rx) = channel();
+                event_loop
+                    .handle()
+                    .insert_source(rx, |event, _, state| {
+                        if let ChannelEvent::Msg(event) = event {
+                            state.finish_dotnet_reload(event);
+                        }
+                    })
+                    .expect("Failed to register .NET reload event source");
+                match crate::ssd::dotnet_reload::DotNetReloadManager::start(
+                    crate::ssd::dotnet_reload::ReloadOptions {
+                        executable,
+                        config,
+                        project,
+                        watch_root,
+                        dev: paths.dev,
+                    },
+                    current.clone(),
+                    tx,
+                ) {
+                    Ok(manager) => Some(manager),
+                    Err(error) => {
+                        warn!(%error, "could not start C# reload manager");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         let (runtime_async_event_tx, runtime_async_event_rx) = channel();
         decoration_evaluator.set_async_event_sender(runtime_async_event_tx);
         let runtime_async_loop_handle = event_loop.handle();
@@ -1781,6 +1832,7 @@ impl ShojiWM {
             layer_effect_evaluation_cache: HashMap::new(),
             popup_effect_evaluation_cache: HashMap::new(),
             config_error_report,
+            dotnet_reload_manager,
             layer_backdrop_cache: HashMap::new(),
             layer_framebuffer_effect_states: HashMap::new(),
             layer_effect_cache: HashMap::new(),
@@ -2776,6 +2828,19 @@ impl ShojiWM {
     }
 
     pub fn reload_decoration_runtime(&mut self) {
+        if let DecorationRuntimeEvaluator::DotNet(_) = &self.decoration_evaluator {
+            if let Some(manager) = &self.dotnet_reload_manager {
+                manager.reload();
+            } else {
+                self.config_error_report =
+                    Some(crate::config_error::ConfigErrorReport::hot_reload(
+                        "C# reload manager is unavailable; see startup log",
+                    ));
+                self.schedule_redraw();
+            }
+            return;
+        }
+
         if self.decoration_evaluator.as_embedded().is_none() {
             self.config_error_report = Some(crate::config_error::ConfigErrorReport::hot_reload(
                 "hot reload is only available for the TypeScript runtime",
@@ -2859,6 +2924,61 @@ impl ShojiWM {
         self.request_tty_maintenance("config-hot-reload");
         self.schedule_redraw();
         info!("hot reloaded TypeScript config");
+    }
+
+    fn finish_dotnet_reload(&mut self, event: crate::ssd::dotnet_reload::ReloadEvent) {
+        use crate::ssd::dotnet_reload::ReloadEvent;
+        let next = match event {
+            ReloadEvent::Failed(error) => {
+                warn!(%error, "C# reload failed; keeping current runtime");
+                self.config_error_report =
+                    Some(crate::config_error::ConfigErrorReport::hot_reload(error));
+                self.schedule_redraw();
+                return;
+            }
+            ReloadEvent::Ready(next) => next,
+        };
+        let DecorationRuntimeEvaluator::DotNet(previous) = &self.decoration_evaluator else {
+            return;
+        };
+        let previous = previous.clone();
+        // No fallible user-code operation follows the commit. Preparation has
+        // already completed OnEnable and validated live-window preview trees.
+        self.sync_runtime_display_state();
+        self.decoration_evaluator
+            .sync_input_state(self.runtime_input_device_state().clone());
+        if let Err(error) = previous.copy_environment_to(&next) {
+            if let Some(manager) = &self.dotnet_reload_manager {
+                manager.activated(previous);
+            }
+            self.config_error_report =
+                Some(crate::config_error::ConfigErrorReport::hot_reload(error));
+            self.schedule_redraw();
+            return;
+        }
+        self.finalize_all_closing_snapshots("config-hot-reload");
+        self.decoration_evaluator = DecorationRuntimeEvaluator::DotNet(next.clone());
+        if let Some(manager) = &self.dotnet_reload_manager {
+            manager.activated(next);
+        }
+        previous.retire("reload");
+        self.runtime_scheduler_enabled = false;
+        self.mark_all_window_decoration_policies_reloaded();
+        self.config_error_report = None;
+        self.runtime_poll_dirty = true;
+        self.runtime_node_only_window_ids.clear();
+        self.runtime_dirty_window_ids.extend(
+            self.space
+                .elements()
+                .map(|window| self.snapshot_window(window).id)
+                .collect::<Vec<_>>(),
+        );
+        self.decoration_hover_target = None;
+        self.decoration_active_target = None;
+        self.request_full_damage();
+        self.request_tty_maintenance("config-hot-reload");
+        self.schedule_redraw();
+        info!("hot reloaded C# config");
     }
 
     pub fn enable_initial_decoration_runtime(&mut self) {

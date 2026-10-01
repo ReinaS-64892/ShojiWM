@@ -133,8 +133,57 @@ Build the library and pass its DLL to `--config`. Keep its dependencies and
 `.deps.json` beside the DLL. The worker uses `AssemblyDependencyResolver` and a
 collectible `AssemblyLoadContext`, sharing the public `ShojiWM` assembly identity
 with the host. Config code never runs in the compositor process. Collectibility
-provides a future reload boundary; hot reload and automatic worker restart are
-not implemented in this milestone. Restart ShojiWM after rebuilding a config.
+is not used for in-process hot reload. Each runtime generation is a fresh worker
+process loading an immutable copy of the config and adjacent dependencies.
+
+## Reload during development
+
+`Super+Shift+R` reloads the DLL without restarting the compositor. If
+`--dotnet-project` is specified, it builds that project first. Build and worker
+initialization failures retain the active runtime and display/log the error.
+Build failures include the last 8 KiB of compiler diagnostics in that report.
+
+For automatic rebuild after saving C# sources:
+
+```sh
+dotnet build dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj -c Release --disable-build-servers -m:1
+cargo build -p shoji_wm
+./target/debug/shoji_wm --runtime dotnet --dev \
+  --decoration-runtime "$PWD/dotnet/ShojiWM.Runtime/bin/Release/net10.0/ShojiWM.Runtime" \
+  --config "$PWD/dotnet/ShojiWM.Example/bin/Release/net10.0/ShojiWM.Example.dll" \
+  --dotnet-project "$PWD/dotnet/ShojiWM.Example/ShojiWM.Example.csproj"
+```
+
+Add `--tty` for a TTY session. The initial DLL still needs the initial build
+above; subsequent builds go to temporary generation directories, not that DLL.
+`--config`'s filename must match the project's output assembly filename.
+Without `--dotnet-project`, `--dev` watches the DLL directory instead; rebuild
+the same Debug/Release DLL you passed to `--config` using your own build command.
+Without `--dev`, only the explicit shortcut triggers reload.
+
+The source watcher polls content every 100 ms, debounces saves for 400 ms,
+serializes builds, and discards candidates superseded during a build. By default
+it watches the nearest ancestor containing `Directory.Build.props` (the `dotnet`
+directory in this repository), or the project's own directory. `--runtime-dir`
+overrides the source watch root, useful for referenced projects elsewhere.
+It watches `.cs`, `.csproj`, `.props`, `.targets`, `.json`, and `.dll`, excluding
+`bin`, `obj`, `Generated`, `.git`, `node_modules`, `target`, and reserved
+`shoji-dotnet-*` staging directories.
+Changes outside that root need a manual reload. The worker host/public API must
+be rebuilt separately when its own code or binary contract changes.
+
+New workers run `OnEnable("reload")` and preview existing windows through the
+Rust tree decoder before commit. Old workers then receive
+`OnDisable("reload")`, have at most 100 ms to respond, and are terminated/reaped.
+Statics, delegates, timers, and tasks inside the old process are discarded.
+Detached user-created processes and external side effects are not transactional.
+There is no state migration API yet. A crashed worker is quarantined; the same
+reload shortcut or a subsequent watched edit can recover it. There is no
+automatic crash-restart loop. Builds have a 120 s deadline; protocol requests
+retain the existing 2 s deadline.
+
+See [the reload architecture and verification report](RELOAD.md) for the exact
+TypeScript behavior, ownership boundary, and headless integration tests.
 
 `WaylandWindow` exposes typed snapshot values and close/maximize/minimize/focus/
 fullscreen commands. `RenderContext` supplies time, preview status, and typed
@@ -222,8 +271,8 @@ Messages are limited to 8 MiB and decoded trees to the serializers' default
 depth limits. A Rust pipe thread bounds both blocked writes and reads with a
 two-second exchange deadline. On EOF, timeout, malformed response, ID/kind
 mismatch, or worker failure, the transport kills/reaps the worker and reports
-a runtime error. Protocol failures quarantine that backend until ShojiWM is
-restarted, avoiding a process-spawn loop per frame. Existing compositor error/
+a runtime error. Protocol failures quarantine that generation until explicit
+reload or a watched edit, avoiding a process-spawn loop per frame. Existing compositor error/
 static-decoration fallback paths apply. Normal final evaluator drop attempts
 a bounded (100 ms) `lifecycleDisable` before terminating the process; cleanup
 callbacks are best effort when the worker has failed.
@@ -309,13 +358,13 @@ cargo test -p shoji_wm real_dotnet_worker_decodes_example_and_dispatches_delegat
 
 Not ported: reactive signals/computed/state hooks, node reconciliation/patches,
 poll/timer scheduler, pointer/gesture callbacks, hover/active delegates,
-managed-window layout/state and animations, lifecycle persisted state/hot
-reload, key bindings, workspace/output/input configuration, shader/effect API,
+managed-window layout/state and animations, lifecycle persisted state,
+key bindings, workspace/output/input configuration, shader/effect API,
 process/env/IPC controllers, and asset resolution. This example is decoration
 composition with window commands, not a port of the default hybrid tiling WM.
 
 Next steps are a managed-window result/config API, scheduler dirty notification
-semantics, hover/active dispatch, and an explicit process-restart/reload lifecycle.
+semantics, hover/active dispatch, and explicit lifecycle state migration.
 Reactive values should evaluate to ordinary DTO values; signal engine internals
 should stay out of the wire protocol. The existing shared DTO source can later
 move to a versioned protocol crate/schema if more backends need it.
