@@ -443,7 +443,7 @@ pub struct ShojiWM {
     pub layer_effect_evaluation_cache: HashMap<String, crate::ssd::EffectEvaluationCacheEntry>,
     pub popup_effect_evaluation_cache: HashMap<String, crate::ssd::EffectEvaluationCacheEntry>,
     pub config_error_report: Option<crate::config_error::ConfigErrorReport>,
-    dotnet_reload_manager: Option<crate::ssd::dotnet_reload::DotNetReloadManager>,
+    dotnet_reload_manager: Option<crate::ssd::dotnet::reload::DotNetReloadManager>,
     pub layer_backdrop_cache: HashMap<String, crate::backend::shader_effect::CachedBackdropTexture>,
     pub layer_framebuffer_effect_states:
         HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
@@ -1584,8 +1584,8 @@ impl ShojiWM {
                         }
                     })
                     .expect("Failed to register .NET reload event source");
-                match crate::ssd::dotnet_reload::DotNetReloadManager::start(
-                    crate::ssd::dotnet_reload::ReloadOptions {
+                match crate::ssd::dotnet::reload::DotNetReloadManager::start(
+                    crate::ssd::dotnet::reload::ReloadOptions {
                         executable,
                         config,
                         project,
@@ -2926,8 +2926,8 @@ impl ShojiWM {
         info!("hot reloaded TypeScript config");
     }
 
-    fn finish_dotnet_reload(&mut self, event: crate::ssd::dotnet_reload::ReloadEvent) {
-        use crate::ssd::dotnet_reload::ReloadEvent;
+    fn finish_dotnet_reload(&mut self, event: crate::ssd::dotnet::reload::ReloadEvent) {
+        use crate::ssd::dotnet::reload::ReloadEvent;
         let next = match event {
             ReloadEvent::Failed(error) => {
                 warn!(%error, "C# reload failed; keeping current runtime");
@@ -2942,12 +2942,15 @@ impl ShojiWM {
             return;
         };
         let previous = previous.clone();
-        // No fallible user-code operation follows the commit. Preparation has
-        // already completed OnEnable and validated live-window preview trees.
+        // Preparation completed OnEnable and validated preview trees. The
+        // .NET-only commit switches the assembly in the same worker process.
         self.sync_runtime_display_state();
         self.decoration_evaluator
             .sync_input_state(self.runtime_input_device_state().clone());
-        if let Err(error) = previous.copy_environment_to(&next) {
+        if let Err(error) = previous
+            .copy_environment_to(&next)
+            .and_then(|_| next.activate_prepared())
+        {
             if let Some(manager) = &self.dotnet_reload_manager {
                 manager.activated(previous);
             }
@@ -2959,9 +2962,11 @@ impl ShojiWM {
         self.finalize_all_closing_snapshots("config-hot-reload");
         self.decoration_evaluator = DecorationRuntimeEvaluator::DotNet(next.clone());
         if let Some(manager) = &self.dotnet_reload_manager {
-            manager.activated(next);
+            manager.activated(next.clone());
         }
-        previous.retire("reload");
+        if !previous.shares_worker_with(&next) {
+            previous.retire("reload");
+        }
         self.runtime_scheduler_enabled = false;
         self.mark_all_window_decoration_policies_reloaded();
         self.config_error_report = None;

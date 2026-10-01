@@ -14,7 +14,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOURCES = [
-    "src/shojiwm/src/ssd/external_protocol.rs",
+    "src/shojiwm/src/ssd/dotnet/protocol.rs",
     "src/shojiwm/src/ssd/bridge.rs",
     "src/shojiwm/src/ssd/window_model.rs",
     "src/shojiwm/src/ssd/interaction.rs",

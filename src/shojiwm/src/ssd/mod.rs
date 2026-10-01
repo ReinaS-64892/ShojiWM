@@ -10,12 +10,9 @@
 //! Rendering, hit-testing and TS bridging are implemented in later milestones.
 
 mod bridge;
-mod dotnet_evaluator;
-pub(crate) mod dotnet_reload;
+pub(crate) mod dotnet;
 mod embedded_runtime;
 mod evaluator;
-mod external_protocol;
-mod external_transport;
 mod integration;
 mod interaction;
 mod window_model;
@@ -24,7 +21,7 @@ use smithay::utils::Logical;
 
 use crate::backend::text::{LabelSpec, measure_label_intrinsic};
 
-pub use dotnet_evaluator::DotNetDecorationEvaluator;
+pub use dotnet::DotNetDecorationEvaluator;
 
 pub use bridge::{
     DecorationBridgeError, WireCompiledEffect, WireDecorationChild, WireDecorationNode, WireProps,

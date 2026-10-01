@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Runtime.CompilerServices;
 using ShojiWM;
 using ShojiWM.Example;
 using ShojiWM.Runtime;
@@ -190,6 +191,146 @@ Test("handler IDs do not cross runtime generations", () =>
     Check(oldHandler != nextHandler);
     Check(nextSession.Handle(Request("invokeHandler", handler: oldHandler)).Invoked == false);
     Check(nextSession.Handle(Request("invokeHandler", handler: nextHandler)).Invoked == true);
+});
+
+Test("collectible assembly reload releases handlers, tasks, timer, thread, event and GCHandle", () =>
+{
+    var marker = Path.GetTempFileName();
+    Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_MARKER", marker);
+    Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_TEXT", "original");
+    try
+    {
+        using var host = new ConfigurationHost(typeof(ReloadFixtureConfig).Assembly.Location);
+        Check(host.Handle(Request("lifecycleEnable")).Ok);
+        var first = host.Handle(Request("evaluate", window: snapshot)).Serialized!;
+        var oldHandler = Nodes(first).Single(node => node.Kind == "Button").Props.OnClick!.Handler!.Id;
+        for (var i = 0; i < 20; i++)
+        {
+            var text = $"generation-{i}";
+            Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_TEXT", text);
+            var prepared = host.Handle(new ExternalRuntimeRequest
+            {
+                RequestId = (ulong)i, Kind = "prepareAssembly", ConfigPath = typeof(ReloadFixtureConfig).Assembly.Location,
+                NowMs = 0, DisplayState = [], InputState = [],
+            });
+            Check(prepared.Ok, prepared.Error ?? "prepare failed");
+            var preview = host.Handle(Request("evaluateCandidatePreview", window: snapshot));
+            Check(preview.Ok && Nodes(preview.Serialized!).Single(node => node.Kind == "Label").Props.Text == text);
+            Check(host.Handle(Request("invokeHandler", handler: oldHandler)).Invoked == (i == 0));
+            Check(host.Handle(Request("commitAssembly")).Ok);
+            Check(host.PendingUnloadCount == 0, "old ALC still rooted");
+            Check(host.UnloadedCount == i + 1);
+            var rendered = host.Handle(Request("evaluate", window: snapshot));
+            Check(Nodes(rendered.Serialized!).Single(node => node.Kind == "Label").Props.Text == text);
+            Check(host.Handle(Request("invokeHandler", handler: oldHandler)).Invoked == false);
+        }
+        Check(host.Handle(Request("shutdownAssemblies")).Ok);
+        host.Dispose();
+        Check(host.PendingUnloadCount == 0 && host.UnloadedCount == 21);
+        var lines = File.ReadAllLines(marker);
+        Check(lines.Count(line => line.StartsWith("dispose:")) == 21);
+        Check(lines.Count(line => line.StartsWith("disable:")) == 21);
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_MARKER", null);
+        Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_TEXT", null);
+        File.Delete(marker);
+    }
+});
+
+Test("missing, broken, wrong entry and managed failures preserve active assembly and allow retry", () =>
+{
+    var broken = Path.GetTempFileName();
+    File.WriteAllText(broken, "not an assembly");
+    Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_TEXT", "retained");
+    try
+    {
+        using var host = new ConfigurationHost(typeof(ReloadFixtureConfig).Assembly.Location);
+        Check(host.Handle(Request("lifecycleEnable")).Ok);
+        ExternalRuntimeResponse Prepare(string path) => host.Handle(new()
+        {
+            RequestId = 987, Kind = "prepareAssembly", ConfigPath = path, NowMs = 0, DisplayState = [], InputState = [],
+        });
+        foreach (var path in new[] { broken + ".missing", broken, typeof(IWindowConfig).Assembly.Location })
+        {
+            var result = Prepare(path);
+            Check(!result.Ok && result.RequestId == 987 && result.Kind == "prepareAssembly");
+            Check(host.PendingUnloadCount == 0);
+        }
+        foreach (var failure in new[] { "constructor", "enable", "render" })
+        {
+            Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_FAILURE", failure);
+            var result = Prepare(typeof(ReloadFixtureConfig).Assembly.Location);
+            if (failure == "render")
+            {
+                Check(result.Ok);
+                Check(!host.Handle(Request("evaluateCandidatePreview", window: snapshot)).Ok);
+                Check(host.Handle(Request("abortAssembly")).Ok);
+            }
+            else Check(!result.Ok && result.Error!.Contains(failure));
+            Check(host.PendingUnloadCount == 0, $"failed {failure} ALC leaked");
+            var old = host.Handle(Request("evaluate", window: snapshot));
+            Check(old.Ok && Nodes(old.Serialized!).Single(node => node.Kind == "Label").Props.Text == "retained");
+        }
+        Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_FAILURE", "disable");
+        Check(Prepare(typeof(ReloadFixtureConfig).Assembly.Location).Ok);
+        Check(host.Handle(Request("commitAssembly")).Ok);
+        Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_FAILURE", null);
+        Check(Prepare(typeof(ReloadFixtureConfig).Assembly.Location).Ok);
+        Check(host.Handle(Request("commitAssembly")).Ok); // Throwing OnDisable still disposes/unloads.
+        Check(host.PendingUnloadCount == 0);
+        Check(!host.Handle(Request("commitAssembly")).Ok);
+        Check(!host.Handle(Request("evaluateCandidatePreview", window: snapshot)).Ok);
+        Check(host.HandleJson("{\"requestId\":123,\"kind\":\"prepareAssembly\"}").RequestId == 123);
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_FAILURE", null);
+        Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_TEXT", null);
+        File.Delete(broken);
+    }
+});
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+void ClearLeakedSubscription()
+{
+    var cleanup = (Action)AppDomain.CurrentDomain.GetData("ShojiWM.TestCleanup")!;
+    AppDomain.CurrentDomain.SetData("ShojiWM.TestCleanup", null);
+    cleanup();
+}
+
+Test("unload failure is diagnosed and prevents accumulating leaked generations", () =>
+{
+    try
+    {
+        Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_FAILURE", "leak");
+        using var host = new ConfigurationHost(typeof(ReloadFixtureConfig).Assembly.Location);
+        Check(host.Handle(Request("lifecycleEnable")).Ok);
+        Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_FAILURE", null);
+        ExternalRuntimeResponse Prepare() => host.Handle(new()
+        {
+            RequestId = 1001, Kind = "prepareAssembly", ConfigPath = typeof(ReloadFixtureConfig).Assembly.Location,
+            NowMs = 0, DisplayState = [], InputState = [],
+        });
+        Check(Prepare().Ok);
+        Check(host.Handle(Request("commitAssembly")).Ok);
+        Check(host.PendingUnloadCount == 1);
+        var rejected = Prepare();
+        Check(!rejected.Ok && rejected.Error!.StartsWith("unload:") && host.PendingUnloadCount == 1);
+        Check(host.Handle(Request("evaluate", window: snapshot)).Ok);
+        ClearLeakedSubscription();
+        host.VerifyUnloads();
+        Check(host.PendingUnloadCount == 0);
+        Check(Prepare().Ok);
+        Check(host.Handle(Request("abortAssembly")).Ok);
+        Check(host.PendingUnloadCount == 0);
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("SHOJI_TEST_CONFIG_FAILURE", null);
+        if (AppDomain.CurrentDomain.GetData("ShojiWM.TestCleanup") is not null) ClearLeakedSubscription();
+    }
 });
 
 Console.WriteLine($"{passed} tests passed");

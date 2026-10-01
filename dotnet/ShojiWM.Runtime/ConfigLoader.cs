@@ -23,6 +23,12 @@ public sealed class ConfigLoader : AssemblyLoadContext
         return dependency is null ? null : LoadFromAssemblyPath(dependency);
     }
 
+    protected override nint LoadUnmanagedDll(string name)
+    {
+        var dependency = resolver.ResolveUnmanagedDllToPath(name);
+        return dependency is null ? 0 : LoadUnmanagedDllFromPath(dependency);
+    }
+
     public IWindowConfig CreateConfig()
     {
         var types = LoadFromAssemblyPath(path).GetExportedTypes()

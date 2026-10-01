@@ -1,11 +1,11 @@
 //! Semantic MVP protocol for an external runtime. Transport framing lives in
-//! `external_transport`; snapshots, props and actions reuse the existing serde DTOs.
+//! `transport`; snapshots, props and actions reuse the existing serde DTOs.
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::evaluator::RuntimeWindowAction;
-use super::{WaylandOutputSnapshot, WaylandWindowSnapshot, WireDecorationNode};
+use super::super::evaluator::RuntimeWindowAction;
+use super::super::{WaylandOutputSnapshot, WaylandWindowSnapshot, WireDecorationNode};
 use crate::runtime_input::RuntimeInputDeviceSnapshot;
 
 /// Same camelCase vocabulary as the embedded runtime. Only the external
@@ -24,6 +24,8 @@ pub struct ExternalRuntimeRequest<'a> {
     pub now_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<&'a str>,
     pub display_state: &'a BTreeMap<String, WaylandOutputSnapshot>,
     pub input_state: &'a BTreeMap<String, RuntimeInputDeviceSnapshot>,
 }

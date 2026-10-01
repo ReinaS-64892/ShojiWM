@@ -12,14 +12,9 @@ internal static class Program
         {
             if (args.Length != 2 || args[0] != "--config")
                 throw new ArgumentException("usage: ShojiWM.Runtime --config /path/to/Config.dll");
-            var loader = new ConfigLoader(args[1]);
-            try
-            {
-                using var session = new RuntimeSession(loader.CreateConfig());
-                var transport = new NdjsonTransport(Console.OpenStandardInput(), protocolOutput);
-                while (transport.ReadFrame() is string frame) transport.WriteFrame(session.HandleJson(frame));
-            }
-            finally { loader.Unload(); }
+            using var host = new ConfigurationHost(args[1]);
+            var transport = new NdjsonTransport(Console.OpenStandardInput(), protocolOutput);
+            while (transport.ReadFrame() is string frame) transport.WriteFrame(host.HandleJson(frame));
             return 0;
         }
         catch (Exception error)

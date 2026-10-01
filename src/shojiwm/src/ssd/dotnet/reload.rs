@@ -1,104 +1,28 @@
 //! Generation preparation runs outside the compositor event loop. Only a
 //! validated generation is published; build/load failures leave the active
-//! evaluator untouched. No CLR hosting or assembly-unloading contract is needed.
-use super::external_transport::terminate_child;
-use super::{DecorationEvaluator, DotNetDecorationEvaluator};
+//! evaluator untouched. A healthy worker prepares a collectible assembly; only
+//! initial load or crash recovery starts a new worker process.
+#[cfg(test)]
+use super::super::DecorationEvaluator;
+use super::{
+    DotNetDecorationEvaluator,
+    assembly::GenerationDirectory,
+    source::{build_project, source_fingerprint},
+};
 use smithay::reexports::calloop::channel::Sender;
-use std::os::unix::process::CommandExt;
 use std::{
-    collections::hash_map::DefaultHasher,
-    fs,
-    hash::{Hash, Hasher},
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-
 const POLL: Duration = Duration::from_millis(100);
 const DEBOUNCE: Duration = Duration::from_millis(400);
-const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[derive(Debug)]
-pub struct GenerationDirectory(PathBuf);
-
-impl GenerationDirectory {
-    pub fn create() -> Result<Arc<Self>, String> {
-        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        loop {
-            let path = std::env::temp_dir().join(format!(
-                "shoji-dotnet-{}-{}",
-                std::process::id(),
-                SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
-            // Private staging directory, including config dependencies.
-            use std::os::unix::fs::DirBuilderExt;
-            match fs::DirBuilder::new().mode(0o700).create(&path) {
-                Ok(()) => return Ok(Arc::new(Self(path))),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-
-    pub fn copy_config(config: &Path) -> Result<(Arc<Self>, PathBuf), String> {
-        let config =
-            fs::canonicalize(config).map_err(|e| format!("config {}: {e}", config.display()))?;
-        let directory = Self::create()?;
-        copy_directory(
-            config.parent().ok_or("config has no directory")?,
-            directory.path(),
-        )?;
-        let staged = directory
-            .path()
-            .join(config.file_name().ok_or("config has no filename")?);
-        Ok((directory, staged))
-    }
-}
-
-impl Drop for GenerationDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
-    for entry in fs::read_dir(source).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let kind = entry.file_type().map_err(|e| e.to_string())?;
-        let destination = target.join(entry.file_name());
-        if kind.is_dir() {
-            fs::create_dir(&destination).map_err(|e| e.to_string())?;
-            copy_directory(&entry.path(), &destination)?;
-        } else if kind.is_file() {
-            fs::copy(entry.path(), destination).map_err(|e| e.to_string())?;
-        } else {
-            return Err(format!(
-                "unsupported config dependency: {}",
-                entry.path().display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub struct ReloadOptions {
-    pub executable: PathBuf,
-    pub config: PathBuf,
-    pub project: Option<PathBuf>,
-    pub watch_root: PathBuf,
-    pub dev: bool,
-}
+pub use super::source::ReloadOptions;
 
 pub enum ReloadEvent {
     Ready(DotNetDecorationEvaluator),
@@ -241,149 +165,42 @@ fn prepare_generation(
     } else {
         GenerationDirectory::copy_config(&options.config)?
     };
-    let next =
-        DotNetDecorationEvaluator::for_generation(options.executable.clone(), config, directory);
-    current
-        .copy_environment_to(&next)
-        .map_err(|e| e.to_string())?;
-    next.preload().map_err(|e| e.to_string())?;
-    // Initialization commands must not act on the compositor before commit.
-    let invocation = next.lifecycle_enable("reload").map_err(|e| e.to_string())?;
-    if !invocation.actions.is_empty() {
-        return Err("reload OnEnable returned unsupported window actions".into());
-    }
+    let next = if current.has_active_worker() {
+        current
+            .prepare_assembly(config, directory)
+            .map_err(|e| e.to_string())?
+    } else {
+        let next = DotNetDecorationEvaluator::for_generation(
+            options.executable.clone(),
+            config,
+            directory,
+        );
+        current
+            .copy_environment_to(&next)
+            .map_err(|e| e.to_string())?;
+        next.preload().map_err(|e| e.to_string())?;
+        let invocation = next.lifecycle_enable("reload").map_err(|e| e.to_string())?;
+        if !invocation.actions.is_empty() {
+            return Err("reload OnEnable returned unsupported window actions".into());
+        }
+        next
+    };
     // Run the existing wire decoder and tree validation before retiring old.
     for snapshot in current.window_snapshots().map_err(|e| e.to_string())? {
         if stop.load(Ordering::Acquire) {
             return Err("reload cancelled".into());
         }
-        next.evaluate_window_preview(&snapshot, 0)
+        next.validate_candidate(&snapshot)
             .map_err(|e| e.to_string())?;
     }
     Ok(next)
 }
 
-fn build_project(project: &Path, output: &Path, stop: &AtomicBool) -> Result<(), String> {
-    // Keep diagnostics out of protocol streams and include a bounded tail in
-    // the compositor's error log/overlay when a build fails.
-    fs::create_dir_all(output).map_err(|e| e.to_string())?;
-    let log_path = output.join("build.log");
-    let log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
-    let error_log = log.try_clone().map_err(|e| e.to_string())?;
-    let mut child = Command::new("dotnet")
-        .process_group(0)
-        .arg("build")
-        .arg(project)
-        .args(["--configuration", "Release", "--output"])
-        .arg(output)
-        .args([
-            "--tl:off",
-            "--disable-build-servers",
-            "-m:1",
-            "-p:BuildInParallel=false",
-            "-p:UseSharedCompilation=false",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(error_log))
-        .spawn()
-        .map_err(|e| format!("could not start dotnet build: {e}"))?;
-    let start = Instant::now();
-    loop {
-        if stop.load(Ordering::Acquire) || start.elapsed() >= BUILD_TIMEOUT {
-            terminate_child(&mut child);
-            return Err(format!(
-                "dotnet build cancelled or exceeded 120s deadline\n{}",
-                build_diagnostics(&log_path)
-            ));
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "dotnet build failed: {status}; keeping current runtime\n{}",
-                        build_diagnostics(&log_path)
-                    ))
-                };
-            }
-            Ok(None) => thread::sleep(POLL),
-            Err(error) => {
-                terminate_child(&mut child);
-                return Err(error.to_string());
-            }
-        }
-    }
-}
-
-fn build_diagnostics(path: &Path) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    let result = (|| -> std::io::Result<Vec<u8>> {
-        let mut file = fs::File::open(path)?;
-        let length = file.metadata()?.len();
-        file.seek(SeekFrom::Start(length.saturating_sub(8192)))?;
-        let mut bytes = Vec::new();
-        file.take(8192).read_to_end(&mut bytes)?;
-        Ok(bytes)
-    })();
-    result
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
-}
-
-fn source_fingerprint(options: &ReloadOptions) -> Result<u64, String> {
-    let mut hash = DefaultHasher::new();
-    if options.project.is_some() {
-        hash_sources(&options.watch_root, &mut hash)?;
-    } else {
-        // Watch the assembly plus adjacent dependencies, not only its mtime.
-        hash_sources(
-            options.config.parent().ok_or("config has no directory")?,
-            &mut hash,
-        )?;
-    }
-    Ok(hash.finish())
-}
-
-fn hash_sources(root: &Path, hash: &mut DefaultHasher) -> Result<(), String> {
-    let mut entries = fs::read_dir(root)
-        .map_err(|e| format!("{}: {e}", root.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let kind = entry.file_type().map_err(|e| e.to_string())?;
-        if kind.is_dir() {
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("shoji-dotnet-")
-                && !matches!(
-                    entry.file_name().to_str(),
-                    Some("bin" | "obj" | ".git" | "Generated" | "node_modules" | "target")
-                )
-            {
-                hash_sources(&path, hash)?;
-            }
-        } else if kind.is_file()
-            && matches!(
-                path.extension().and_then(|s| s.to_str()),
-                Some("cs" | "csproj" | "props" | "targets" | "json" | "dll")
-            )
-        {
-            path.hash(hash);
-            fs::read(path).map_err(|e| e.to_string())?.hash(hash);
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::{DecorationNode, DecorationNodeKind, WaylandWindowSnapshot};
+    use super::super::super::{DecorationNode, DecorationNodeKind, WaylandWindowSnapshot};
     use super::*;
+    use std::{fs, path::Path, process::Command};
 
     fn snapshot() -> WaylandWindowSnapshot {
         WaylandWindowSnapshot {
@@ -419,16 +236,31 @@ mod tests {
         let root = GenerationDirectory::create().unwrap();
         let executable = root.path().join("worker.py");
         fs::write(&executable, r#"#!/usr/bin/env python3
-import json, sys
+import json, sys, os
 value = open(sys.argv[2]).read()
+candidate = None
+candidate_path = None
 for line in sys.stdin:
     q = json.loads(line)
     response = dict(kind=q['kind'], requestId=q['requestId'], ok=True)
-    if q['kind'] == 'lifecycleEnable' and value == 'init-error':
-        response.update(ok=False, error='initialization failed')
-    if q['kind'] in ('evaluate', 'evaluatePreview'):
-        response['serialized'] = dict(kind='WindowBorder', props={}, children=[dict(kind='Label', props=dict(text=value), children=[]), dict(kind='Window', props={}, children=[])])
-        if value == 'bad-tree': response['serialized']['children'] = []
+    if q['kind'] == 'prepareAssembly':
+        candidate_path = q['configPath']
+        candidate = open(candidate_path).read()
+        if candidate == 'init-error':
+            candidate = None
+            response.update(ok=False, error='initialization failed')
+    if q['kind'] == 'commitAssembly':
+        value, candidate = candidate, None
+    if q['kind'] == 'abortAssembly':
+        if candidate_path and not os.path.exists(candidate_path):
+            value = 'abort-lost-dependencies'
+            response.update(ok=False, error='candidate dependencies removed before cleanup')
+        candidate = None
+        candidate_path = None
+    text = candidate if q['kind'] == 'evaluateCandidatePreview' else value
+    if q['kind'] in ('evaluate', 'evaluatePreview', 'evaluateCandidatePreview'):
+        response['serialized'] = dict(kind='WindowBorder', props={}, children=[dict(kind='Label', props=dict(text=text), children=[]), dict(kind='Window', props={}, children=[])])
+        if text == 'bad-tree': response['serialized']['children'] = []
     print(json.dumps(response), flush=True)
 "#).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -445,7 +277,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn rejected_generation_keeps_old_worker_and_twelve_swaps_reap_resources() {
+    fn rejected_assembly_keeps_worker_and_twelve_swaps_release_staging() {
         let (_root, options) = fake_options();
         let stop = AtomicBool::new(false);
         let mut current = DotNetDecorationEvaluator::new_shadowed(
@@ -468,21 +300,54 @@ for line in sys.stdin:
             let text = format!("generation-{generation}");
             fs::write(&options.config, &text).unwrap();
             let next = prepare_generation(&options, &current, &stop).unwrap();
+            next.activate_prepared().unwrap();
             assert_eq!(
                 label(&next.evaluate_window(&snapshot(), 0).unwrap().node),
                 Some(text.as_str())
             );
             let old_pid = current.test_process_id().unwrap();
             let old_directory = current.test_generation_path().unwrap();
-            current.retire("reload");
             drop(current);
-            assert!(
-                !Path::new("/proc").join(old_pid.to_string()).exists(),
-                "retired process leaked"
+            assert_eq!(
+                next.test_process_id(),
+                Some(old_pid),
+                "reload restarted worker"
             );
             assert!(!old_directory.exists(), "retired staging directory leaked");
             current = next;
         }
+    }
+
+    #[test]
+    fn dropping_prepared_candidate_aborts_without_replacing_active_assembly() {
+        let (_root, options) = fake_options();
+        let current = DotNetDecorationEvaluator::new_shadowed(
+            options.executable.clone(),
+            options.config.clone(),
+        );
+        current.lifecycle_enable("initial").unwrap();
+        current.evaluate_window(&snapshot(), 0).unwrap();
+        fs::write(&options.config, "discarded").unwrap();
+        let next = prepare_generation(&options, &current, &AtomicBool::new(false)).unwrap();
+        let directory = next.test_generation_path().unwrap();
+        assert_eq!(current.test_process_id(), next.test_process_id());
+        assert_eq!(
+            label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
+            Some("old")
+        );
+        drop(next);
+        assert!(!directory.exists());
+        assert_eq!(
+            label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
+            Some("old")
+        );
+        fs::write(&options.config, "accepted").unwrap();
+        let next = prepare_generation(&options, &current, &AtomicBool::new(false)).unwrap();
+        next.activate_prepared().unwrap();
+        assert_eq!(
+            label(&next.evaluate_window(&snapshot(), 0).unwrap().node),
+            Some("accepted")
+        );
     }
 
     #[test]
@@ -521,6 +386,7 @@ for line in sys.stdin:
             rx.try_recv().is_err(),
             "activated two generations without commit acknowledgement"
         );
+        next.activate_prepared().unwrap();
         manager.activated(next);
     }
 
@@ -589,10 +455,14 @@ public sealed class Config : IWindowConfig {{
                 panic!("expected successful reload")
             };
             let old_pid = current.test_process_id().unwrap();
-            current.retire("reload");
+            next.activate_prepared().unwrap();
             *current = next.clone();
             manager.activated(next);
-            assert!(!Path::new("/proc").join(old_pid.to_string()).exists());
+            assert_eq!(
+                current.test_process_id(),
+                Some(old_pid),
+                "assembly reload restarted CLR"
+            );
         };
         activate(receive(), &mut current);
         current.evaluate_window(&snapshot(), 0).unwrap();

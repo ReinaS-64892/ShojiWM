@@ -22,11 +22,19 @@ def main():
         return dict(requestId=index, kind=kind, nowMs=1234, displayState={}, inputState={}, **fields)
 
     requests = [request(1, "drainPreload"), request(2, "lifecycleEnable", reason="initial"),
-                request(3, "evaluate", snapshot=snapshot, windowId="1"),
-                request(4, "lifecycleDisable", reason="shutdown")]
+                request(3, "evaluate", snapshot=snapshot, windowId="1")]
+    for _ in range(12):
+        for kind, fields in [
+            ("prepareAssembly", dict(configPath=str(config))),
+            ("evaluateCandidatePreview", dict(snapshot=snapshot, windowId="1")),
+            ("commitAssembly", {}),
+            ("evaluate", dict(snapshot=snapshot, windowId="1")),
+        ]:
+            requests.append(request(len(requests) + 1, kind, **fields))
+    requests.append(request(len(requests) + 1, "shutdownAssemblies", reason="shutdown"))
     result = subprocess.run([str(runtime), "--config", str(config)],
                             input="".join(json.dumps(q) + "\n" for q in requests),
-                            capture_output=True, text=True, timeout=10, check=True)
+                            capture_output=True, text=True, timeout=30, check=True)
     responses = [json.loads(line) for line in result.stdout.splitlines()]
     assert len(responses) == len(requests), result.stdout
     for request_value, response in zip(requests, responses):
@@ -46,7 +54,11 @@ def main():
     handler = next(node for node in nodes(tree) if node["kind"] == "Button")["props"]["onClick"]
     assert handler["kind"] == "runtime-handler" and handler["id"].startswith("handler-")
     assert "config enabled" in result.stderr
-    print("PASS actual .NET worker: assembly loading, lifecycle, NDJSON correlation, Unicode snapshot, tree, handler descriptor")
+    rendered = [response["serialized"] for response in responses if response["kind"] == "evaluate"]
+    ids = [next(node for node in nodes(tree) if node["kind"] == "Button")["props"]["onClick"]["id"] for tree in rendered]
+    assert len(ids) == 13 and len(set(ids)) == 13
+    assert "ALC(s) still referenced" not in result.stderr, result.stderr
+    print("PASS actual .NET worker: lifecycle, NDJSON, tree, 12 assembly reloads in one process, isolated handler IDs, ALC cleanup")
 
 
 if __name__ == "__main__":

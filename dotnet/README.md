@@ -132,14 +132,24 @@ public sealed class MyConfig : IWindowConfig
 Build the library and pass its DLL to `--config`. Keep its dependencies and
 `.deps.json` beside the DLL. The worker uses `AssemblyDependencyResolver` and a
 collectible `AssemblyLoadContext`, sharing the public `ShojiWM` assembly identity
-with the host. Config code never runs in the compositor process. Collectibility
-is not used for in-process hot reload. Each runtime generation is a fresh worker
-process loading an immutable copy of the config and adjacent dependencies.
+with the host. Config code never runs in the compositor process. The worker stays alive during
+reload: each configuration generation uses its own collectible ALC and an
+immutable copy of the config and adjacent dependencies. New generations are
+loaded and validated before the host switches sessions and unloads the old ALC.
+
+For config-owned tasks, threads, timers, external events or managed/native
+handles, implement `IDisposable` or `IAsyncDisposable`. The host calls
+`OnDisable("reload")`, clears session callbacks/snapshots, then disposes the config
+before requesting ALC unload. If both disposal interfaces exist, asynchronous
+disposal takes precedence. Cancel and await/join background work, unsubscribe
+external events and release handles there. `OnDisable` exceptions are reported
+but do not skip disposal. Failed `OnEnable` also receives cleanup. A constructor
+that throws is responsible for any resources created before it throws.
 
 ## Reload during development
 
 `Super+Shift+R` reloads the DLL without restarting the compositor. If
-`--dotnet-project` is specified, it builds that project first. Build and worker
+`--dotnet-project` is specified, it builds that project first. Build and assembly
 initialization failures retain the active runtime and display/log the error.
 Build failures include the last 8 KiB of compiler diagnostics in that report.
 
@@ -172,15 +182,24 @@ It watches `.cs`, `.csproj`, `.props`, `.targets`, `.json`, and `.dll`, excludin
 Changes outside that root need a manual reload. The worker host/public API must
 be rebuilt separately when its own code or binary contract changes.
 
-New workers run `OnEnable("reload")` and preview existing windows through the
-Rust tree decoder before commit. Old workers then receive
-`OnDisable("reload")`, have at most 100 ms to respond, and are terminated/reaped.
-Statics, delegates, timers, and tasks inside the old process are discarded.
-Detached user-created processes and external side effects are not transactional.
-There is no state migration API yet. A crashed worker is quarantined; the same
-reload shortcut or a subsequent watched edit can recover it. There is no
-automatic crash-restart loop. Builds have a 120 s deadline; protocol requests
-retain the existing 2 s deadline.
+The existing worker loads a candidate ALC, calls `OnEnable("reload")`, and previews
+existing windows through the Rust tree decoder before commit. Build, assembly
+load, enable and preview exceptions discard the candidate and preserve the
+active config. Commit switches sessions, calls old `OnDisable("reload")`, disposes
+old resources, unloads the ALC and verifies collection using weak references.
+GC is forced only at these lifecycle boundaries (at most three passes), not on
+render turns. If an old ALC remains rooted, stderr reports an unload error and
+further preparations are rejected until it becomes collectible, avoiding an
+unbounded number of leaked generations. Already active decorations can continue.
+
+Statics inside collectible assemblies are reset; host/API statics and external
+side effects are outside the rollback contract. There is no state migration API
+yet. A crashed or unresponsive worker is quarantined; the reload shortcut or a
+subsequent watched edit starts a replacement worker. There is no automatic
+crash-restart loop. Builds have a 120 s deadline; protocol requests retain the
+existing 2 s deadline. Because candidate user code runs in the same worker,
+a stuck constructor/enable/dispose/finalizer can require terminating that worker;
+exception rollback does not promise to preserve a wedged worker.
 
 See [the reload architecture and verification report](RELOAD.md) for the exact
 TypeScript behavior, ownership boundary, and headless integration tests.
@@ -207,9 +226,10 @@ import/preload, signal reconciliation, scheduler, lifecycle reload and handler
 registries are unchanged.
 
 The new `DotNetDecorationEvaluator` uses `ExternalRuntimeRequest` and
-`ExternalRuntimeResponse` from `external_protocol.rs`. Pipe framing and process
-management are confined to `external_transport.rs`. The C# `RuntimeSession` is
-independent of `NdjsonTransport`, so the same semantics can later use a socket
+`ExternalRuntimeResponse` from `ssd/dotnet/protocol.rs`. Pipe framing and process
+management are confined to `ssd/dotnet/transport.rs`. Managed assembly lifecycle
+lives in `ConfigurationHost` / `ConfigurationGeneration`; `RuntimeSession` and
+the host are independent of `NdjsonTransport`, so the same semantics can later use a socket
 or another transport.
 
 Protocol v1 is UTF-8 NDJSON over stdin/stdout, one synchronous response per
@@ -246,11 +266,17 @@ Supported requests:
 | `evaluateCached` | `snapshot` or known `windowId` | Renders using the supplied/latest snapshot |
 | `invokeHandler` | `windowId`, `handlerId` | Runs a delegate, renders the updated tree, returns actions |
 | `windowClosed` | `windowId` | Clears that window's registry and calls `OnWindowClosed` |
+| `prepareAssembly` | `configPath` | Loads/initializes one candidate ALC without switching the active config |
+| `evaluateCandidatePreview` | `snapshot` | Renders candidate for Rust validation without live registration/actions |
+| `commitAssembly` | none | Switches to candidate and disposes/unloads the previous generation |
+| `abortAssembly` | none | Disposes/unloads the candidate, retaining the active config |
+| `shutdownAssemblies` | none | Disposes/unloads all config generations before worker termination |
 
 Requests include `nowMs`, `displayState`, and `inputState`. Successful responses
 contain `requestId`, `kind`, `ok: true`, optional `serialized`/`invoked`, and
 `actions` using the existing `RuntimeWindowAction` JSON. Failures use `ok: false`
-and `error`. Unknown kinds and malformed requests produce a failure response;
+and `error`. Candidate load/initialization/render rejection is a correlated semantic error and
+does not quarantine the worker. Unknown kinds and malformed requests produce a failure response;
 if a malformed envelope has a readable ID/kind, those are preserved. Completely
 unparseable JSON returns ID 0 / `protocolError`.
 
@@ -274,7 +300,7 @@ mismatch, or worker failure, the transport kills/reaps the worker and reports
 a runtime error. Protocol failures quarantine that generation until explicit
 reload or a watched edit, avoiding a process-spawn loop per frame. Existing compositor error/
 static-decoration fallback paths apply. Normal final evaluator drop attempts
-a bounded (100 ms) `lifecycleDisable` before terminating the process; cleanup
+a bounded (100 ms) `shutdownAssemblies` before terminating the process; cleanup
 callbacks are best effort when the worker has failed.
 
 ## Binding generation
@@ -341,7 +367,9 @@ The .NET test executable requires no test-framework NuGet packages and returns
 a failing exit code on any assertion failure. It covers serialization,
 optionality, literal enum mapping, full `requestId` precision, composition,
 handler cleanup/stability, malformed/unknown messages, lifecycle, assembly
-loading, and NDJSON. Python tests the actual worker process. Rust fake workers
+loading, NDJSON, 20 same-process reloads, weak-reference ALC collection, rejected
+assembly/entry/initialization/render failures, managed resource cleanup, and
+unload-leak detection/refusal. Python tests the actual worker process. Rust fake workers
 test existing decoding/validation, caching, malformed/mismatched responses,
 worker death, and blocked stdin without needing a Wayland session.
 

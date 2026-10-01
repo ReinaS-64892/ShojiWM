@@ -5,8 +5,10 @@ namespace ShojiWM.Runtime;
 
 /// Semantic requests are independent of stdin/stdout framing. A future socket
 /// transport can call the same session. User callbacks never cross the wire.
-public sealed class RuntimeSession(IWindowConfig config) : IDisposable
+public sealed class RuntimeSession : IDisposable
 {
+    private IWindowConfig? config;
+    public RuntimeSession(IWindowConfig config) => this.config = config;
     private sealed record WindowEntry(WaylandWindowSnapshot Snapshot, Dictionary<string, (string Id, Action Callback)> Handlers);
     private readonly Dictionary<string, WindowEntry> windows = [];
     private readonly List<RuntimeWindowAction> actions = [];
@@ -20,6 +22,7 @@ public sealed class RuntimeSession(IWindowConfig config) : IDisposable
         var kind = "protocolError";
         try
         {
+            if (config is null) throw new ObjectDisposedException(nameof(RuntimeSession));
             using var document = JsonDocument.Parse(json);
             var root = document.RootElement;
             if (root.TryGetProperty("requestId", out var id) && id.TryGetUInt64(out var value)) requestId = value;
@@ -38,6 +41,7 @@ public sealed class RuntimeSession(IWindowConfig config) : IDisposable
         actions.Clear();
         try
         {
+            if (config is null) throw new ObjectDisposedException(nameof(RuntimeSession));
             WireDecorationNode? serialized = null;
             bool? invoked = null;
             switch (request.Kind)
@@ -45,20 +49,21 @@ public sealed class RuntimeSession(IWindowConfig config) : IDisposable
                 case "drainPreload":
                     break; // Assembly was already loaded, so startup errors precede this ACK.
                 case "lifecycleEnable":
-                    if (!enabled) { config.OnEnable(request.Reason ?? "initial"); enabled = true; }
+                    if (!enabled) { enabled = true; config.OnEnable(request.Reason ?? "initial"); }
                     break;
                 case "lifecycleDisable":
                     Disable(request.Reason ?? "shutdown");
                     break;
                 case "evaluate":
                 case "evaluatePreview":
+                case "evaluateCandidatePreview":
                 case "evaluateCached":
                     var snapshot = request.Snapshot ??
                         (request.WindowId is string cachedId && windows.TryGetValue(cachedId, out var cached) ? cached.Snapshot : null)
                         ?? throw new JsonException("evaluate requires a snapshot or a known windowId");
                     if (string.IsNullOrEmpty(snapshot.Id) || request.WindowId is string requestedId && requestedId != snapshot.Id)
                         throw new JsonException("snapshot id must match windowId");
-                    serialized = Render(snapshot, request, request.Kind == "evaluatePreview");
+                    serialized = Render(snapshot, request, request.Kind is "evaluatePreview" or "evaluateCandidatePreview");
                     break;
                 case "invokeHandler":
                     var windowId = request.WindowId ?? throw new JsonException("invokeHandler requires windowId");
@@ -95,7 +100,7 @@ public sealed class RuntimeSession(IWindowConfig config) : IDisposable
     {
         var context = new RenderContext(request.NowMs, preview, request.DisplayState, request.InputState);
         var window = new WaylandWindow(snapshot, action => { if (!preview) actions.Add(action); });
-        var composition = config.RenderWindow(window, context) ?? throw new InvalidOperationException("config returned no composition");
+        var composition = config!.RenderWindow(window, context) ?? throw new InvalidOperationException("config returned no composition");
         var handlers = new Dictionary<string, (string Id, Action Callback)>();
         windows.TryGetValue(snapshot.Id, out var previous);
         var tree = composition.ToWire((key, callback) =>
@@ -111,9 +116,21 @@ public sealed class RuntimeSession(IWindowConfig config) : IDisposable
 
     private void Disable(string reason)
     {
-        try { if (enabled) config.OnDisable(reason); }
+        try { if (enabled) config?.OnDisable(reason); }
         finally { enabled = false; windows.Clear(); actions.Clear(); }
     }
 
-    public void Dispose() => Disable("shutdown");
+    public void Dispose()
+    {
+        var previous = config;
+        try { Disable("shutdown"); }
+        finally
+        {
+            // Remove all host-held config/delegate references before ALC.Unload.
+            config = null;
+            if (previous is IAsyncDisposable asyncDisposable)
+                asyncDisposable.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            else if (previous is IDisposable disposable) disposable.Dispose();
+        }
+    }
 }

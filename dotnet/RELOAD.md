@@ -69,121 +69,167 @@ modified for C# reload.
 
 ## C# decision and lifecycle
 
-Selected: **external runtime process replacement**. The semantic boundary is a
-replaceable runtime generation, just as TS has replaceable isolates. Since .NET
-already runs out of process, a fresh worker avoids collectible-ALC reachability,
-static field, timer and task unloading problems. Metadata Update and
-`dotnet watch` method patching are not used. The existing `RuntimeSession` /
-`IWindowConfig.OnEnable/OnDisable` are the activation/disposal boundary; no
-second C# lifecycle hierarchy is necessary.
+Selected: **collectible configuration ALCs inside the existing external worker**.
+The CLR and transport stay alive across configuration reloads. The compositor
+continues to own Rust/Smithay state and never hosts CoreCLR. No hostfxr/nethost,
+backend traits, common language interfaces or new crate are introduced. TS/V8
+implementation and lifecycle are unchanged. Metadata Update and `dotnet watch`
+method patching are not used.
 
 ```mermaid
 flowchart TD
-    R[Running old] -->|Shortcut or debounced dev edit| B[Build or copy DLL dependencies]
+    R[Running active assembly] -->|Shortcut or debounced edit| B[Build or stage immutable DLL dependencies]
     B -->|Failure| R
-    B -->|Success| I[Start new worker / preload / OnEnable reload]
-    I -->|Failure| D[Dispose candidate / kill and reap]
+    B -->|Success| I[Same worker: load candidate collectible ALC / OnEnable reload]
+    I -->|Exception| D[Dispose candidate / Unload / verify collection]
     D --> R
-    I --> V[Preview live snapshots through existing Rust decoder]
-    V -->|Failure| D
-    V -->|Success| S[Commit on compositor event loop]
-    S --> C[Old OnDisable reload / bounded termination]
-    C --> N[Running new / invalidate decorations / redraw]
+    I --> V[Candidate preview / existing Rust decode and validation]
+    V -->|Failure or superseded save| D
+    V -->|Success| S[Commit on existing compositor event loop]
+    S --> C[Switch session / old OnDisable / Dispose / Unload]
+    C --> W[Bounded collection / weak-reference verification]
+    W --> N[Running new assembly / invalidate decorations / redraw]
+    W -->|Still rooted| L[Log unload failure / reject further preparations]
+    L --> N
 ```
 
-`ssd/dotnet_reload.rs::DotNetReloadManager` owns one serialized background worker,
-one source fingerprint and one pending activation. No build runs in the
-compositor event loop. Content polling/debounce is an opt-in C# extension;
-there is no existing TS watcher to reuse. `--dotnet-project` specifies an
-optional project to build in Release, and `--runtime-dir` can override its watch
-root. DLL-only configurations are still supported. Build output and staged
-dependencies are private generation directories released with their evaluator.
-The initial config is also shadow-copied so a later build cannot rewrite its
-mapped assembly. Unsupported symlink dependencies are reported as errors.
+Only initialization or recovery from worker death creates a worker process.
+Healthy reloads retain the same worker PID and pipes, with monotonically
+increasing request IDs. The JSON envelope adds optional `configPath` generated
+from the Rust serde source. Semantic commands are `prepareAssembly`,
+`evaluateCandidatePreview`, `commitAssembly`, `abortAssembly` and
+`shutdownAssemblies`; no CLR object/delegate/function pointer crosses the wire.
+Normal render, lifecycle, handler and tree JSON remains compatible.
 
-`state.rs::finish_dotnet_reload` commits only after candidate preload, enable,
-and preview validation succeeded. Input/output state is refreshed at commit.
-Candidate preview calls suppress compositor actions/handler registration as in
-the existing preview contract. Candidate enable window actions are rejected
-rather than applied before commit. Previously cached live snapshots are used
-for validation; windows that appear later render through the ordinary path.
-The candidate's private user-code effects during preview are its responsibility.
+Preparation runs on the existing background reload thread. It stages/builds
+config dependencies, asks the managed host to load and enable a candidate, and
+validates cached live window snapshots through the existing Rust decoder.
+Candidate previews suppress window actions and live callback registration.
+Normal evaluations/handlers continue to target the active session until commit.
+A Rust RAII pending lease aborts candidates rejected by validation, newer source
+content, event delivery failure or cancellation. The old DLL directory remains
+available throughout preparation. At commit, Rust clears old cached trees and
+marks decorations dirty; generation-specific handler IDs reject stale callbacks.
 
-The old worker remains active throughout build/preparation failure. Only after
-commit is it retired, with a 100 ms disable deadline and process termination.
-Worker/build children are launched in their own process groups; cancellation
-uses the system `kill` utility and reaps the direct child. Detached processes or
-external file/network effects created by arbitrary user code are outside the
-rollback contract. CLR statics, tasks, timers and delegates in the old worker
-cannot survive its exit. Handler IDs include a fresh per-session generation
-identifier, so stale IDs never resolve to a new generation's callback.
+Build, missing/broken assembly, entry-point, constructor, enable and preview
+exceptions retain the active assembly. Managed exceptions become strings with
+stage information (`assemblyLoad`, `initialization`, `reload`, `unload`) rather
+than retained user Exception/Type instances. Cleanup errors go to stderr;
+`OnDisable` failure still runs config disposal, and does not roll back a committed
+new config. Incomplete ALC collection is reported explicitly and blocks further
+preparations, preventing accumulation; collection can be retried after external
+references are released.
 
-NDJSON message shapes, camelCase fields, requestId correlation and the existing
-wire decoder are unchanged. There is no socket reconnect protocol: Rust owns
-the new child pipes and does not reuse the outgoing transport. Worker crashes
-produce bounded protocol errors, quarantine that generation and leave the
-compositor alive. Manual reload or a later watched edit can recover it; this
-implementation does not continuously restart a crashing config.
+## Responsibility and dependency separation
+
+| File / module | Responsibility / dependencies |
+|---|---|
+| `ssd/dotnet/transport.rs` | Worker startup/termination and bounded NDJSON pipe I/O; standard library only. |
+| `ssd/dotnet/assembly.rs` | Private immutable dependency staging and RAII directory cleanup; standard library only. |
+| `ssd/dotnet/source.rs` | Source fingerprinting/build and .NET-specific path/options DTO; no compositor types or ALC commands. |
+| `ssd/dotnet/reload.rs` | Serialized preparation/debounce and calloop publication; existing .NET integration glue. |
+| `ssd/dotnet/protocol.rs` | Wire envelope; reuses existing ShojiWM snapshots, actions and tree DTOs. |
+| `ssd/dotnet/evaluator.rs` | Existing DecorationEvaluator adapter, tree decode/validation, pending transaction lease, cache and error conversion. |
+| `ConfigurationHost.cs` | Owns active/candidate generation, prepares/commits/aborts and verifies unload. No file watching or transport. |
+| `ConfigurationGeneration.cs` | Owns loader and session; releases managed references, disables/disposes and requests unload. |
+| `ConfigLoader.cs` | Collectible ALC, dependency resolver, shared API identity and native dependency loading. |
+| `RuntimeSession.cs` | Per-generation config, window snapshots, delegate registry and action buffer. |
+| `Program.cs` / `NdjsonTransport.cs` | Long-lived worker protocol loop and framing; no watcher or source build. |
+
+The portable Rust operations are localized for later movement. Protocol/evaluator
+still intentionally reference core snapshots/decoder, and the reload publisher
+uses calloop; those are the existing integration edges, not an invented upstream
+abstraction. CLI/runtime selection and public `IWindowConfig` are unchanged.
+There is no new independent crate, backend/plugin discovery or generic backend
+API. Runtime hosting remains OS child-process ownership: hostfxr-specific handle
+layers would serve no purpose in this architecture.
+
+## Resource ownership and unload
+
+| Resource | Creator / owner | Release / reload lifetime |
+|---|---|---|
+| Worker child + pipe thread/FDs | Rust transport | Survives healthy reload; bounded termination/reap on failure or final drop. |
+| Config/dependency stage | Rust assembly directory/evaluator | Candidate drop or last old evaluator reference after commit removes it. |
+| ALC / resolver | Managed generation | `Unload()` after config/session cleanup; only weak references retained for verification. |
+| Config / session | Managed generation | Active until switch; disable/dispose, clear references and detach before unload. |
+| Handler delegates / window cache | RuntimeSession | Cleared on window close/disable/dispose; generation IDs never reused. |
+| Config timers/tasks/threads/events/singletons | User config | User must cancel/await/join/unsubscribe/dispose; host calls `IAsyncDisposable` or `IDisposable` (async wins). |
+| Config native dependencies | ALC via AssemblyDependencyResolver | Runtime owns library lifetime loaded via `LoadUnmanagedDllFromPath`; user owns any separate handles. |
+| GCHandle / native callbacks / function pointers | None created by production bridge | Arbitrary config-created handles must be released by config disposal; never sent to Rust. |
+| Assembly/Type/MethodInfo | Temporary loader locals | No managed entry-point/reflection cache is retained in the host. |
+
+A partially failed `OnEnable` is disabled and disposed. Constructors that throw
+must release resources they created before throwing. Config `OnDisable` remains
+the existing semantic hook; optional BCL disposal adds cleanup without changing
+the core configuration API. External effects and shared public-API/host statics
+are not transactionally restored. User code must not place config references in
+long-lived shared statics without disposing them.
+
+ALC unload is cooperative. Non-inlined load/release/exception frames unwind
+before weak-reference verification so JIT stack locals and user exceptions do
+not produce false unload failures. Weak references track resurrection. At most
+three collect/finalizer/collect passes occur at lifecycle boundaries; ordinary
+rendering never forces GC. This follows Microsoft's
+[assembly unloadability guidance](https://learn.microsoft.com/en-us/dotnet/standard/assembly/unloadability).
+
+There is no guarantee that arbitrary user code unloads: stuck tasks, leaked
+subscriptions/handles, or non-returning disposal/finalizers can retain an ALC or
+wedge the worker. Rust retains its existing 2 s protocol deadline, then terminates
+the worker and reports an error instead of deadlocking the compositor. Such a
+worker cannot preserve the old config; manual reload or a watched edit starts
+another worker. There is no automatic crash restart loop. Final process shutdown
+has a best-effort 100 ms cleanup budget. Build cancellation/deadline (120 s),
+process-group cleanup, source polling (100 ms), debounce (400 ms) and exclusion
+rules remain unchanged.
 
 ## Verification
 
-Verified on 2026-10-01 with .NET SDK 10.0.112, inside the sandbox:
+Verified on 2026-10-01 inside the sandbox with .NET SDK 10.0.112:
 
-- **PASS** Release .NET build: zero warnings/errors; C# harness 13 tests.
-- **PASS** `cargo build -p shoji_wm --offline` (normal compositor binary).
-- **PASS** Generated-binding freshness and generator tests (3 tests).
-- **PASS** Real worker NDJSON / dynamic assembly / composition smoke test.
-- **PASS** `cargo test --workspace --offline`: compositor 246 passed, 0 failed,
-  3 ignored; other workspace tests and doc-tests passed.
-- **PASS** Both ignored .NET integration tests were separately run against the
-  latest workspace test binary: 2 passed. This includes actual source watching,
-  build-error and initialization-error retention, recovery, and worker death.
-- **PASS** Four fake-worker/staging/watcher tests, including 12 generation swaps
-  and 15 rapid saves, are included in the workspace result above.
-- **NOT RUN** Driver-dependent EGL program-retirement test, a real display
-  hot-reload smoke test, and a long-running compositor RSS benchmark.
+- **PASS** Release managed build: zero warnings/errors; 16 BCL-only tests.
+- **PASS** `cargo build -p shoji_wm --offline`: normal compositor binary, no warnings.
+- **PASS** Binding-generator freshness and 3 generator tests.
+- **PASS** Actual worker NDJSON test with 12 same-process assembly reloads.
+- **PASS** `cargo test --workspace --offline`: compositor 247 passed, 0 failed,
+  3 ignored; other workspace tests/doc-tests passed.
+- **PASS** Both opt-in .NET integration tests were also executed separately,
+  including actual source rebuild/rollback and unchanged PID on healthy reload.
 
-The tests do not require a real Wayland session:
+The tests run headlessly; no real Wayland session is needed.
 
-| Test | What it checks |
-|---|---|
-| `watch_hash_tracks_source_content_and_ignores_build_outputs` | Content changes are detected; `obj` build output is excluded. |
-| `staging_is_immutable_and_removed_after_last_reference` | DLL replacement cannot change an active copy; last-reference cleanup removes its directory. |
-| `rejected_generation_keeps_old_worker_and_twelve_swaps_reap_resources` | Initialization errors and invalid composition retain old PID/tree; 12 swaps reap every retired PID and staging directory. |
-| `watcher_debounces_rapid_saves_and_has_one_pending_activation` | 15 rapid saves produce the latest tree; no second activation occurs before commit acknowledgement. |
-| `real_dotnet_source_reload_rolls_back_build_and_initialization_failures` | Actual saved C# builds/load/decode, syntax-error rollback, initialization-exception rollback, fixed-source recovery, worker-crash recovery. |
-| C# `handler IDs do not cross runtime generations` | Old delegate IDs cannot invoke the new session's delegate. Existing scoped-handler/lifecycle tests remain active. |
+| Result | Test | Verification |
+|---|---|---|
+| PASS | Managed repeated reload | 20 switches in one host; previous ALC weak references are collected, old handler IDs fail, shutdown disposes all 21 generations exactly once. |
+| PASS | Managed resource fixture | Config owns a timer, cancellation-backed Task, thread, AppDomain event and GCHandle; disposal stops/releases all and ALC verification succeeds. |
+| PASS | Managed failure/retry | Missing/broken DLL, no config entry point, constructor/enable/render exception preserve old tree; fixes reload; throwing disable still disposes/unloads. |
+| PASS | Managed deliberate leak | Retained external event roots old ALC; diagnostic and prepare refusal; releasing reference permits collection/retry. |
+| PASS | Python actual worker | 12 assembly replacements in one process, NDJSON requestId correlation, unique handler IDs, no unload warning. |
+| PASS | Rust fake worker | 12 same-PID switches, rejected init/tree keep old PID/tree, cancelled pending lease aborts and removes staging. |
+| PASS | Rust watcher | 15 rapid saves debounce to latest config; only one activation before acknowledgment. |
+| PASS | Rust actual SDK build | Source edit changes decoded label with unchanged worker PID; syntax/enable errors preserve config; fixed source recovers; killed worker can be restarted. |
 
-Run the fake-worker tests with:
-
-```sh
-cargo test -p shoji_wm dotnet_reload
-```
-
-Run the actual .NET watcher/build integration after building the worker:
+Commands:
 
 ```sh
 dotnet build dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj -c Release --disable-build-servers -m:1
+dotnet run --project dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj -c Release --no-build
+python3 tools/test-dotnet-worker.py --configuration Release
+python3 tools/generate-dotnet-bindings.py --check
+python3 tools/test-dotnet-generator.py
+cargo test -p shoji_wm 'ssd::dotnet'
 SHOJI_TEST_DOTNET_RUNTIME="$PWD/dotnet/ShojiWM.Runtime/bin/Release/net10.0/ShojiWM.Runtime" \
   cargo test -p shoji_wm real_dotnet_source_reload -- --ignored --nocapture
 ```
 
-The real integration test creates temporary configs instead of editing the
-user's example. The repeated-generation test proves old process/resource
-retirement; it is not a compositor RSS growth benchmark. Keybindings/event
-subscriptions/scheduler timers are not yet public C# APIs, so duplication of
-those registrations is not claimed as tested. A real display session remains
-necessary to verify visible decoration changes with running applications.
+**NOT RUN:** the driver-dependent EGL retirement test, a visual TTY/WInit
+reload and a long-running compositor RSS benchmark. C# keybindings/event subscriptions/scheduler APIs are not yet
+public APIs; config-owned BCL resources are tested instead.
 
 ## Follow-ups
 
-Add opt-in lifecycle persisted-state DTOs, capability/version negotiation and
-visual compositor tests. Consider a proper filesystem event watcher if content
-polling becomes expensive for large projects. Config public API/worker updates
-still require rebuilding the host, and NuGet/assets outside the watched root
-need a manual reload or explicit watch-root selection. Measure compositor
-memory and frame latency under real workloads: build/prepare is asynchronous,
-but ordinary evaluations remain synchronous JSON round trips, and retiring a
-worker can occupy the commit turn for up to 100 ms. Transactional TS reload is
-a separate improvement requiring care around its shared runtime cell and
-pointer dispatcher; this change deliberately leaves that behavior intact.
+Measure real compositor reload latency/RSS and add display smoke coverage.
+Capability/version negotiation and persisted config state are still follow-ups.
+The worker and shared API contract require a host rebuild/restart when changed;
+only user assemblies and their private dependencies reload. Native handles and
+external services need user cleanup contracts. Keep the current integration edges
+until upstream defines its abstraction; only then select the crate/API boundary.
