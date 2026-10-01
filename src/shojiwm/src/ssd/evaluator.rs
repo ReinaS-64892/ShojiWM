@@ -47,7 +47,7 @@ fn managed_rect_debug_enabled() -> bool {
 
 /// Dynamic decoration evaluation boundary.
 ///
-/// This trait represents the hand-off point to the embedded TypeScript runtime. It allows
+/// This trait represents the hand-off point to a programmable runtime. It allows
 /// ShojiWM to build and validate window-aware decoration trees while keeping the dynamic
 /// evaluation contract explicit.
 pub trait DecorationEvaluator {

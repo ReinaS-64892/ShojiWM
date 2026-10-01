@@ -1,3 +1,7 @@
 /target
 /misc
 /node_modules
+**/bin/
+**/obj/
+__pycache__/
+/dotnet/**/Generated/

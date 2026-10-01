@@ -1,0 +1,39 @@
+name: .NET runtime
+
+on:
+  push:
+    paths:
+      - dotnet/**
+      - tools/*dotnet*.py
+      - src/shojiwm/src/ssd/**
+      - src/shojiwm/src/runtime_input.rs
+      - .github/workflows/dotnet.yml
+  pull_request:
+    paths:
+      - dotnet/**
+      - tools/*dotnet*.py
+      - src/shojiwm/src/ssd/**
+      - src/shojiwm/src/runtime_input.rs
+      - .github/workflows/dotnet.yml
+
+permissions:
+  contents: read
+
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Generate and verify bindings
+        run: |
+          python3 tools/generate-dotnet-bindings.py
+          python3 tools/generate-dotnet-bindings.py --check
+          python3 tools/test-dotnet-generator.py
+      - name: Build and test (BCL only)
+        run: |
+          dotnet build dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj --configuration Release --disable-build-servers -m:1
+          dotnet run --project dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj --configuration Release --no-build
+          python3 tools/test-dotnet-worker.py --configuration Release

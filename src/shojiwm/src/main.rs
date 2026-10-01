@@ -83,9 +83,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ShojiWMBackend::WInit
     };
 
-    info!(?backend, "starting shoji_wm");
+    info!(?backend, runtime = ?args.runtime_backend, "starting shoji_wm");
     let result = backend.run();
     profiler::dump_if_enabled("shutdown");
+    if let Err(error) = &result {
+        error!(%error, "compositor backend failed");
+    }
     result?;
 
     Ok(())
@@ -174,6 +177,7 @@ fn sanitize_inherited_compositor_environment() {
 
 #[derive(Debug, Clone)]
 struct CliArgs {
+    runtime_backend: install_paths::RuntimeBackendKind,
     tty: bool,
     log_off: bool,
     no_log_rotate: bool,
@@ -203,11 +207,27 @@ impl CliArgs {
             .or(env_xwayland_satellite_glamor)
             .filter(|value| matches!(value.as_str(), "gl" | "es" | "none"));
         let config_path = parse_option_value(&args, "--config").map(PathBuf::from);
+        let runtime_backend = match parse_option_value(&args, "--runtime").as_deref() {
+            None | Some("typescript") => install_paths::RuntimeBackendKind::TypeScript,
+            Some("dotnet") => install_paths::RuntimeBackendKind::DotNet,
+            Some(value) => {
+                eprintln!("unknown runtime {value:?}; expected typescript or dotnet");
+                std::process::exit(2);
+            }
+        };
+        if runtime_backend == install_paths::RuntimeBackendKind::DotNet
+            && config_path.is_none()
+            && std::env::var_os("SHOJI_CONFIG").is_none()
+        {
+            eprintln!("--runtime dotnet requires --config /path/to/Config.dll (or SHOJI_CONFIG)");
+            std::process::exit(2);
+        }
         let runtime_dir = parse_option_value(&args, "--runtime-dir").map(PathBuf::from);
         let decoration_runtime =
             parse_option_value(&args, "--decoration-runtime").map(PathBuf::from);
 
         Self {
+            runtime_backend,
             tty: args.iter().any(|arg| arg == "--tty"),
             log_off: args.iter().any(|arg| arg == "--log-off") || env_log_off,
             no_log_rotate: args.iter().any(|arg| arg == "--no-log-rotate") || env_no_rotate,
@@ -224,6 +244,7 @@ impl CliArgs {
 
 fn init_runtime_paths(args: &CliArgs) {
     install_paths::init_runtime_path_options(install_paths::RuntimePathOptions {
+        backend: args.runtime_backend,
         dev: args.dev,
         config_path: args.config_path.clone(),
         runtime_dir: args.runtime_dir.clone(),

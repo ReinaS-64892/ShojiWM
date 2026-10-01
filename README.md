@@ -2,6 +2,10 @@
 <h2>ShojiWM</h2>
 <p>A highly customizable Wayland compositor configured with TypeScript/TSX.</p>
 
+An opt-in [C#/.NET runtime backend](dotnet/README.md) is available as an MVP.
+TypeScript remains the default; the Rust/Smithay compositor and V8 fast paths
+are preserved.
+
 <a href="https://discord.gg/NheBbu3FX6" data-size="large">
   <img alt="Discord" src="https://img.shields.io/discord/1516819976496091318.svg?label=Discord&logo=Discord&colorB=7289da&style=for-the-badge">
 </a>

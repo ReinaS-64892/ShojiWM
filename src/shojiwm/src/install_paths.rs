@@ -7,10 +7,39 @@ use tracing::warn;
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimePathOptions {
+    pub backend: RuntimeBackendKind,
     pub dev: bool,
     pub config_path: Option<PathBuf>,
     pub runtime_dir: Option<PathBuf>,
     pub decoration_runtime: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeBackendKind {
+    #[default]
+    TypeScript,
+    DotNet,
+}
+
+pub fn runtime_backend_kind() -> RuntimeBackendKind {
+    RUNTIME_PATH_OPTIONS
+        .get()
+        .map(|options| options.backend)
+        .unwrap_or_default()
+}
+
+/// .NET uses the existing CLI paths, without the TypeScript project discovery.
+pub fn dotnet_runtime_paths() -> (PathBuf, PathBuf) {
+    let options = RUNTIME_PATH_OPTIONS.get().cloned().unwrap_or_default();
+    let executable = options
+        .decoration_runtime
+        .or_else(|| std::env::var_os("SHOJI_DECORATION_RUNTIME").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("ShojiWM.Runtime"));
+    let config = options
+        .config_path
+        .or_else(|| std::env::var_os("SHOJI_CONFIG").map(PathBuf::from))
+        .unwrap_or_default();
+    (executable, config)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

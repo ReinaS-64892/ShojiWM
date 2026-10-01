@@ -1528,20 +1528,31 @@ impl ShojiWM {
         // Get the loop signal, used to stop the event loop
         let loop_signal = event_loop.get_signal();
         let loop_handle = event_loop.handle();
-        let runtime_paths = crate::install_paths::decoration_runtime_paths();
-        let evaluator = EmbeddedDecorationEvaluator::for_paths(
-            runtime_paths.script_path,
-            runtime_paths.config_path,
-        )
-        .with_working_dir(runtime_paths.working_dir);
-        let config_error_report = match evaluator.preload() {
+        let decoration_evaluator = match crate::install_paths::runtime_backend_kind() {
+            crate::install_paths::RuntimeBackendKind::TypeScript => {
+                let runtime_paths = crate::install_paths::decoration_runtime_paths();
+                DecorationRuntimeEvaluator::Embedded(
+                    EmbeddedDecorationEvaluator::for_paths(
+                        runtime_paths.script_path,
+                        runtime_paths.config_path,
+                    )
+                    .with_working_dir(runtime_paths.working_dir),
+                )
+            }
+            crate::install_paths::RuntimeBackendKind::DotNet => {
+                let (executable, config) = crate::install_paths::dotnet_runtime_paths();
+                DecorationRuntimeEvaluator::DotNet(crate::ssd::DotNetDecorationEvaluator::new(
+                    executable, config,
+                ))
+            }
+        };
+        let config_error_report = match decoration_evaluator.preload() {
             Ok(()) => None,
             Err(error) => {
-                warn!(?error, "failed to preload TypeScript config");
+                warn!(?error, "failed to preload runtime config");
                 Some(crate::config_error::ConfigErrorReport::initial_load(error))
             }
         };
-        let decoration_evaluator = DecorationRuntimeEvaluator::Embedded(evaluator);
         let (runtime_async_event_tx, runtime_async_event_rx) = channel();
         decoration_evaluator.set_async_event_sender(runtime_async_event_tx);
         let runtime_async_loop_handle = event_loop.handle();
@@ -2324,6 +2335,11 @@ impl ShojiWM {
         // Get the name of the listening socket.
         // Clients will connect to this socket.
         let socket_name = listening_socket.socket_name().to_os_string();
+        info!(
+            socket = %socket_name.to_string_lossy(),
+            runtime_dir = ?std::env::var_os("XDG_RUNTIME_DIR"),
+            "listening for Wayland clients"
+        );
 
         let loop_handle = event_loop.handle();
 
@@ -2846,11 +2862,14 @@ impl ShojiWM {
     }
 
     pub fn enable_initial_decoration_runtime(&mut self) {
+        if matches!(
+            &self.decoration_evaluator,
+            DecorationRuntimeEvaluator::Static(_)
+        ) {
+            return;
+        }
         self.sync_runtime_display_state();
-        let lifecycle_result = match self.decoration_evaluator.as_embedded() {
-            Some(evaluator) => evaluator.lifecycle_enable("initial", None),
-            None => return,
-        };
+        let lifecycle_result = self.decoration_evaluator.lifecycle_enable_initial();
         match lifecycle_result {
             Ok(invocation) => {
                 self.consume_runtime_lifecycle_invocation(invocation);
@@ -2864,10 +2883,7 @@ impl ShojiWM {
             }
         }
 
-        let background_effect_result = match self.decoration_evaluator.as_embedded() {
-            Some(evaluator) => evaluator.background_effect_config(),
-            None => return,
-        };
+        let background_effect_result = self.decoration_evaluator.background_effect_config();
         match background_effect_result {
             Ok(config) => {
                 self.configured_background_effect = config;

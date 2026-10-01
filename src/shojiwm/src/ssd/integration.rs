@@ -802,6 +802,7 @@ impl WindowDecorationState {
 pub enum DecorationRuntimeEvaluator {
     Static(super::StaticDecorationEvaluator),
     Embedded(super::EmbeddedDecorationEvaluator),
+    DotNet(super::DotNetDecorationEvaluator),
 }
 
 #[derive(Debug, Clone)]
@@ -843,6 +844,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(evaluator) => evaluator.evaluate_window(window, now_ms),
             Self::Embedded(evaluator) => evaluator.evaluate_window(window, now_ms),
+            Self::DotNet(evaluator) => evaluator.evaluate_window(window, now_ms),
         }
     }
 
@@ -854,6 +856,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(evaluator) => evaluator.evaluate_window_preview(window, now_ms),
             Self::Embedded(evaluator) => evaluator.evaluate_window_preview(window, now_ms),
+            Self::DotNet(evaluator) => evaluator.evaluate_window_preview(window, now_ms),
         }
     }
 
@@ -865,6 +868,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(evaluator) => evaluator.window_decoration_policy(window, context),
             Self::Embedded(evaluator) => evaluator.window_decoration_policy(window, context),
+            Self::DotNet(evaluator) => evaluator.window_decoration_policy(window, context),
         }
     }
 
@@ -875,6 +879,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(DecorationSchedulerTick::default()),
             Self::Embedded(evaluator) => evaluator.scheduler_tick(now_ms),
+            Self::DotNet(evaluator) => evaluator.scheduler_tick(now_ms),
         }
     }
 
@@ -892,6 +897,9 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
             Self::Embedded(evaluator) => {
                 evaluator.evaluate_cached_window(window_id, window, now_ms, force_full_reevaluation)
             }
+            Self::DotNet(evaluator) => {
+                evaluator.evaluate_cached_window(window_id, window, now_ms, force_full_reevaluation)
+            }
         }
     }
 
@@ -899,6 +907,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(()),
             Self::Embedded(evaluator) => evaluator.window_closed(window_id),
+            Self::DotNet(evaluator) => evaluator.window_closed(window_id),
         }
     }
 
@@ -911,6 +920,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationHandlerInvocation::default()),
             Self::Embedded(evaluator) => evaluator.invoke_handler(window_id, handler_id, now_ms),
+            Self::DotNet(evaluator) => evaluator.invoke_handler(window_id, handler_id, now_ms),
         }
     }
 
@@ -922,6 +932,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationKeyBindingInvocation::default()),
             Self::Embedded(evaluator) => evaluator.invoke_key_binding(binding_id, now_ms),
+            Self::DotNet(evaluator) => evaluator.invoke_key_binding(binding_id, now_ms),
         }
     }
 
@@ -933,6 +944,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationHandlerInvocation::default()),
             Self::Embedded(evaluator) => evaluator.workspace_activate(event, now_ms),
+            Self::DotNet(evaluator) => evaluator.workspace_activate(event, now_ms),
         }
     }
 
@@ -945,6 +957,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationWindowResizeInvocation::default()),
             Self::Embedded(evaluator) => evaluator.window_resize(window_id, event, now_ms),
+            Self::DotNet(evaluator) => evaluator.window_resize(window_id, event, now_ms),
         }
     }
 
@@ -957,6 +970,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationWindowMoveInvocation::default()),
             Self::Embedded(evaluator) => evaluator.window_move(window_id, event, now_ms),
+            Self::DotNet(evaluator) => evaluator.window_move(window_id, event, now_ms),
         }
     }
 
@@ -969,6 +983,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
             Self::Embedded(evaluator) => evaluator.window_maximize_request(snapshot, event, now_ms),
+            Self::DotNet(evaluator) => evaluator.window_maximize_request(snapshot, event, now_ms),
         }
     }
 
@@ -981,6 +996,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
             Self::Embedded(evaluator) => evaluator.window_minimize_request(snapshot, event, now_ms),
+            Self::DotNet(evaluator) => evaluator.window_minimize_request(snapshot, event, now_ms),
         }
     }
 
@@ -995,6 +1011,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
             Self::Embedded(evaluator) => {
                 evaluator.window_fullscreen_request(snapshot, event, now_ms)
             }
+            Self::DotNet(evaluator) => evaluator.window_fullscreen_request(snapshot, event, now_ms),
         }
     }
 
@@ -1007,6 +1024,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
             Self::Embedded(evaluator) => evaluator.window_activate_request(snapshot, event, now_ms),
+            Self::DotNet(evaluator) => evaluator.window_activate_request(snapshot, event, now_ms),
         }
     }
 
@@ -1018,6 +1036,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationPointerMoveAsyncInvocation::default()),
             Self::Embedded(evaluator) => evaluator.pointer_move(event, now_ms),
+            Self::DotNet(evaluator) => evaluator.pointer_move(event, now_ms),
         }
     }
 
@@ -1035,6 +1054,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationGestureSwipeAsyncInvocation::default()),
             Self::Embedded(evaluator) => evaluator.gesture_swipe(event, now_ms),
+            Self::DotNet(evaluator) => evaluator.gesture_swipe(event, now_ms),
         }
     }
 
@@ -1052,6 +1072,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(super::DecorationHandlerInvocation::default()),
             Self::Embedded(evaluator) => evaluator.start_close(window_id, now_ms),
+            Self::DotNet(evaluator) => evaluator.start_close(window_id, now_ms),
         }
     }
 
@@ -1064,6 +1085,9 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(LayerEffectEvaluationResult::default()),
             Self::Embedded(evaluator) => {
+                evaluator.evaluate_layer_effects(output_name, layers, now_ms)
+            }
+            Self::DotNet(evaluator) => {
                 evaluator.evaluate_layer_effects(output_name, layers, now_ms)
             }
         }
@@ -1080,17 +1104,49 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
             Self::Embedded(evaluator) => {
                 evaluator.evaluate_popup_effects(output_name, popups, now_ms)
             }
+            Self::DotNet(evaluator) => {
+                evaluator.evaluate_popup_effects(output_name, popups, now_ms)
+            }
         }
     }
 }
 
 impl DecorationRuntimeEvaluator {
+    pub fn background_effect_config(
+        &self,
+    ) -> Result<Option<super::BackgroundEffectConfig>, DecorationEvaluationError> {
+        match self {
+            Self::Embedded(evaluator) => evaluator.background_effect_config(),
+            Self::DotNet(_) | Self::Static(_) => Ok(None),
+        }
+    }
+
+    pub fn preload(&self) -> Result<(), DecorationEvaluationError> {
+        match self {
+            Self::Embedded(evaluator) => evaluator.preload(),
+            Self::DotNet(evaluator) => evaluator.preload(),
+            Self::Static(_) => Ok(()),
+        }
+    }
+
+    pub fn lifecycle_enable_initial(
+        &self,
+    ) -> Result<super::DecorationHandlerInvocation, DecorationEvaluationError> {
+        match self {
+            Self::Embedded(evaluator) => evaluator.lifecycle_enable("initial", None),
+            Self::DotNet(evaluator) => evaluator.lifecycle_enable("initial"),
+            Self::Static(_) => Ok(Default::default()),
+        }
+    }
+
     pub fn sync_display_state(
         &self,
         display_state: std::collections::BTreeMap<String, super::WaylandOutputSnapshot>,
     ) {
-        if let Self::Embedded(evaluator) = self {
-            evaluator.set_display_state(display_state);
+        match self {
+            Self::Embedded(evaluator) => evaluator.set_display_state(display_state),
+            Self::DotNet(evaluator) => evaluator.set_display_state(display_state),
+            Self::Static(_) => {}
         }
     }
 
@@ -1101,8 +1157,10 @@ impl DecorationRuntimeEvaluator {
             crate::runtime_input::RuntimeInputDeviceSnapshot,
         >,
     ) {
-        if let Self::Embedded(evaluator) = self {
-            evaluator.set_input_state(input_state);
+        match self {
+            Self::Embedded(evaluator) => evaluator.set_input_state(input_state),
+            Self::DotNet(evaluator) => evaluator.set_input_state(input_state),
+            Self::Static(_) => {}
         }
     }
 
@@ -1120,7 +1178,7 @@ impl DecorationRuntimeEvaluator {
     pub fn as_embedded(&self) -> Option<&super::EmbeddedDecorationEvaluator> {
         match self {
             Self::Embedded(evaluator) => Some(evaluator),
-            Self::Static(_) => None,
+            Self::Static(_) | Self::DotNet(_) => None,
         }
     }
 }

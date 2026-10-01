@@ -1,0 +1,19 @@
+{
+  "id": "1",
+  "title": "Kitty 日本語",
+  "appId": "kitty",
+  "position": { "x": 0.5, "y": 0.0, "width": 800.0, "height": 600.0 },
+  "rect": { "x": 0.5, "y": 0.0, "width": 800.0, "height": 600.0 },
+  "isFocused": true,
+  "isFloating": true,
+  "isMaximized": false,
+  "isFullscreen": false,
+  "isXwayland": false,
+  "decoration": { "protocol": "none", "clientPreference": null, "configuredMode": "server", "mode": "server" },
+  "sizeConstraints": { "min": null, "max": null },
+  "isResizable": true,
+  "isTransient": false,
+  "parentId": null,
+  "icon": null,
+  "interaction": { "hoveredIds": [], "activeIds": [] }
+}
