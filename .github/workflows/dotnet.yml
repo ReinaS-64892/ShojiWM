@@ -7,6 +7,8 @@ on:
       - tools/*dotnet*.py
       - src/shojiwm/src/ssd/**
       - src/shojiwm/src/runtime_input.rs
+      - Cargo.lock
+      - src/shojiwm/Cargo.toml
       - .github/workflows/dotnet.yml
   pull_request:
     paths:
@@ -14,6 +16,8 @@ on:
       - tools/*dotnet*.py
       - src/shojiwm/src/ssd/**
       - src/shojiwm/src/runtime_input.rs
+      - Cargo.lock
+      - src/shojiwm/Cargo.toml
       - .github/workflows/dotnet.yml
 
 permissions:
@@ -36,4 +40,9 @@ jobs:
         run: |
           dotnet build dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj --configuration Release --disable-build-servers -m:1
           dotnet run --project dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj --configuration Release --no-build
-          python3 tools/test-dotnet-worker.py --configuration Release
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Exercise real hostfxr and production host thread (headless)
+        run: |
+          cargo run --locked --manifest-path dotnet/NativeHost.Tests/Cargo.toml -- \
+            "$PWD/dotnet/ShojiWM.Runtime/bin/Release/net10.0/ShojiWM.Runtime.dll" \
+            "$PWD/dotnet/ShojiWM.Tests/bin/Release/net10.0/ShojiWM.Tests.dll"

@@ -39,7 +39,7 @@ pub fn dotnet_runtime_paths() -> (PathBuf, PathBuf) {
     let executable = options
         .decoration_runtime
         .or_else(|| std::env::var_os("SHOJI_DECORATION_RUNTIME").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("ShojiWM.Runtime"));
+        .unwrap_or_else(|| PathBuf::from("ShojiWM.Runtime.dll"));
     let config = options
         .config_path
         .or_else(|| std::env::var_os("SHOJI_CONFIG").map(PathBuf::from))

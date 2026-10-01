@@ -13,8 +13,8 @@ use super::super::{
     WaylandOutputSnapshot, WaylandWindowSnapshot, WindowTransform,
 };
 use super::{
+    host::InProcessDotNetHost,
     protocol::{ExternalRuntimeRequest, ExternalRuntimeResponse},
-    transport::{ExternalTransport, RESPONSE_TIMEOUT},
 };
 use crate::runtime_input::RuntimeInputDeviceSnapshot;
 
@@ -22,11 +22,11 @@ use crate::runtime_input::RuntimeInputDeviceSnapshot;
 /// runtime and all its native bridge entry points remain independent.
 #[derive(Debug, Clone)]
 pub struct DotNetDecorationEvaluator {
-    executable: PathBuf,
+    component: PathBuf,
     config: PathBuf,
     state: Arc<Mutex<RuntimeState>>,
     pending: Option<Arc<PendingAssembly>>,
-    // Drops after pending cleanup and the state/worker, so config dependencies
+    // Drops after pending cleanup and the state/host, so config dependencies
     // remain available during abort/dispose as well as ordinary shutdown.
     generation: Option<Arc<super::assembly::GenerationDirectory>>,
 }
@@ -43,7 +43,7 @@ impl Drop for PendingAssembly {
     fn drop(&mut self) {
         if !self.completed.load(Ordering::Acquire) {
             let owner = DotNetDecorationEvaluator {
-                executable: PathBuf::new(),
+                component: PathBuf::new(),
                 config: PathBuf::new(),
                 state: self.state.clone(),
                 generation: None,
@@ -62,7 +62,7 @@ impl Drop for PendingAssembly {
 
 #[derive(Debug, Default)]
 struct RuntimeState {
-    transport: Option<ExternalTransport>,
+    host: Option<InProcessDotNetHost>,
     next_request_id: u64,
     failure: Option<String>,
     displays: BTreeMap<String, WaylandOutputSnapshot>,
@@ -71,60 +71,24 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
-    fn quarantine(&mut self, error: String) {
-        if let Some(mut transport) = self.transport.take() {
-            transport.stop();
-        }
-        self.failure = Some(error);
+    fn fail_host(&mut self, error: String) {
+        self.failure = Some(format!("{error}; ShojiWM restart required"));
     }
 }
 
-impl Drop for RuntimeState {
-    fn drop(&mut self) {
-        // Give a healthy config a bounded opportunity to disable before the
-        // transport kills/reaps its worker. A wedged config cannot delay exit.
-        if let Some(transport) = self.transport.as_mut()
-            && let Some(request_id) = self.next_request_id.checked_add(1)
-        {
-            let request = ExternalRuntimeRequest {
-                request_id,
-                kind: "shutdownAssemblies",
-                snapshot: None,
-                window_id: None,
-                handler_id: None,
-                now_ms: 0,
-                reason: Some("shutdown"),
-                config_path: None,
-                display_state: &self.displays,
-                input_state: &self.inputs,
-            };
-            if let Ok(bytes) = serde_json::to_vec(&request) {
-                let _ = transport.exchange(bytes, std::time::Duration::from_millis(100));
-            }
-        }
-    }
-}
+// InProcessDotNetHost owns RAII destruction on the managed host thread.
+// CLR/bootstrap remain loaded for process lifetime.
 
 impl DotNetDecorationEvaluator {
-    #[cfg(test)]
-    pub(super) fn test_process_id(&self) -> Option<u32> {
-        self.state
-            .lock()
-            .unwrap()
-            .transport
-            .as_ref()
-            .map(ExternalTransport::process_id)
-    }
-
     #[cfg(test)]
     pub(super) fn test_generation_path(&self) -> Option<PathBuf> {
         self.generation
             .as_ref()
             .map(|directory| directory.path().to_path_buf())
     }
-    pub fn new(executable: PathBuf, config: PathBuf) -> Self {
+    pub fn new(component: PathBuf, config: PathBuf) -> Self {
         Self {
-            executable,
+            component,
             config,
             state: Arc::new(Mutex::new(RuntimeState::default())),
             generation: None,
@@ -132,11 +96,11 @@ impl DotNetDecorationEvaluator {
         }
     }
 
-    pub fn new_shadowed(executable: PathBuf, config: PathBuf) -> Self {
+    pub fn new_shadowed(component: PathBuf, config: PathBuf) -> Self {
         match super::assembly::GenerationDirectory::copy_config(&config) {
-            Ok((directory, staged)) => Self::for_generation(executable, staged, directory),
+            Ok((directory, staged)) => Self::for_generation(component, staged, directory),
             Err(error) => {
-                let evaluator = Self::new(executable, config);
+                let evaluator = Self::new(component, config);
                 if let Ok(mut state) = evaluator.state.lock() {
                     state.failure = Some(error);
                 }
@@ -146,22 +110,22 @@ impl DotNetDecorationEvaluator {
     }
 
     pub(super) fn for_generation(
-        executable: PathBuf,
+        component: PathBuf,
         config: PathBuf,
         directory: Arc<super::assembly::GenerationDirectory>,
     ) -> Self {
-        let mut evaluator = Self::new(executable, config);
+        let mut evaluator = Self::new(component, config);
         evaluator.generation = Some(directory);
         evaluator
     }
 
-    pub(super) fn has_active_worker(&self) -> bool {
+    pub(super) fn has_active_host(&self) -> bool {
         self.state
             .lock()
-            .is_ok_and(|state| state.failure.is_none() && state.transport.is_some())
+            .is_ok_and(|state| state.failure.is_none() && state.host.is_some())
     }
 
-    pub(crate) fn shares_worker_with(&self, other: &Self) -> bool {
+    pub(crate) fn shares_host_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
@@ -197,7 +161,7 @@ impl DotNetDecorationEvaluator {
     }
 
     /// Only the existing .NET integration calls this at the compositor commit
-    /// boundary. Ordinary reload retains the worker; crash recovery replaces it.
+    /// boundary. Ordinary reload retains the managed host and permanent bootstrap.
     pub(crate) fn activate_prepared(&self) -> Result<(), DecorationEvaluationError> {
         if let Some(pending) = &self.pending {
             if pending.completed.load(Ordering::Acquire) {
@@ -224,7 +188,7 @@ impl DotNetDecorationEvaluator {
     }
 
     pub(crate) fn copy_environment_to(&self, next: &Self) -> Result<(), DecorationEvaluationError> {
-        if self.shares_worker_with(next) {
+        if self.shares_host_with(next) {
             return Ok(());
         }
         let state = self.lock()?;
@@ -244,45 +208,13 @@ impl DotNetDecorationEvaluator {
             .collect())
     }
 
-    /// Retire all evaluator clones at commit, with bounded cleanup even when
-    /// user OnDisable throws or stalls. Process death clears timers/statics.
-    pub(crate) fn retire(&self, reason: &str) {
+    /// Dispose the managed host on its original thread. User cleanup can block;
+    /// there is deliberately no unsafe thread termination or CLR restart.
+    pub(crate) fn retire(&self, _reason: &str) {
         if let Ok(mut state) = self.state.lock() {
-            if let Some(mut transport) = state.transport.take() {
-                let request = ExternalRuntimeRequest {
-                    request_id: state.next_request_id.saturating_add(1),
-                    kind: "shutdownAssemblies",
-                    snapshot: None,
-                    window_id: None,
-                    handler_id: None,
-                    now_ms: 0,
-                    reason: Some(reason),
-                    config_path: None,
-                    display_state: &state.displays,
-                    input_state: &state.inputs,
-                };
-                if let Ok(bytes) = serde_json::to_vec(&request) {
-                    match transport.exchange(bytes, std::time::Duration::from_millis(100)) {
-                        Ok(bytes) => {
-                            match serde_json::from_slice::<ExternalRuntimeResponse>(&bytes) {
-                                Ok(response) if response.ok => {}
-                                Ok(response) => {
-                                    tracing::warn!(error = ?response.error, "C# disable callback failed; terminating worker")
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%error, "invalid C# disable response; terminating worker")
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "C# generation cleanup failed; terminating worker")
-                        }
-                    }
-                }
-                transport.stop();
-            }
+            state.host.take();
             state.windows.clear();
-            state.failure = Some("runtime generation retired".into());
+            state.failure = Some("runtime host retired; ShojiWM restart required".into());
         }
     }
 
@@ -333,10 +265,10 @@ impl DotNetDecorationEvaluator {
         if let Some(error) = &state.failure {
             return Err(DecorationEvaluationError::RuntimeProtocol(error.clone()));
         }
-        let mut rejected_candidate = false;
+        let mut managed_failure = false;
         let result = (|| -> Result<ExternalRuntimeResponse, String> {
-            if state.transport.is_none() {
-                state.transport = Some(ExternalTransport::start(&self.executable, &self.config)?);
+            if state.host.is_none() {
+                state.host = Some(InProcessDotNetHost::start(&self.component, &self.config)?);
             }
             state.next_request_id = state
                 .next_request_id
@@ -357,38 +289,41 @@ impl DotNetDecorationEvaluator {
             };
             let bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
             let bytes = state
-                .transport
+                .host
                 .as_mut()
-                .ok_or("external transport unavailable")?
-                .exchange(bytes, RESPONSE_TIMEOUT)?;
-            let response: ExternalRuntimeResponse = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("invalid external runtime response: {e}"))?;
-            if response.request_id != request_id || response.kind != kind {
-                return Err(format!(
-                    "mismatched response: expected {kind}/{request_id}, got {}/{}",
-                    response.kind, response.request_id
-                ));
-            }
+                .ok_or("runtime host unavailable")?
+                .exchange(bytes)?;
+            let response = Self::decode_response(&bytes, kind, request_id)?;
             if !response.ok {
-                rejected_candidate = matches!(
-                    kind,
-                    "prepareAssembly"
-                        | "evaluateCandidatePreview"
-                        | "abortAssembly"
-                        | "commitAssembly"
-                );
+                managed_failure = true;
                 return Err(response
                     .error
-                    .unwrap_or_else(|| "external runtime returned failure".into()));
+                    .unwrap_or_else(|| "managed runtime returned failure".into()));
             }
             Ok(response)
         })();
         if let Err(error) = &result
-            && !rejected_candidate
+            && !managed_failure
         {
-            state.quarantine(error.clone());
+            state.fail_host(error.clone());
         }
         result.map_err(DecorationEvaluationError::RuntimeProtocol)
+    }
+
+    fn decode_response(
+        bytes: &[u8],
+        kind: &str,
+        request_id: u64,
+    ) -> Result<ExternalRuntimeResponse, String> {
+        let response: ExternalRuntimeResponse = serde_json::from_slice(bytes)
+            .map_err(|e| format!("invalid managed runtime response: {e}"))?;
+        if response.request_id != request_id || response.kind != kind {
+            return Err(format!(
+                "mismatched response: expected {kind}/{request_id}, got {}/{}",
+                response.kind, response.request_id
+            ));
+        }
+        Ok(response)
     }
 
     pub fn preload(&self) -> Result<(), DecorationEvaluationError> {
@@ -433,13 +368,7 @@ impl DotNetDecorationEvaluator {
             now_ms,
             None,
         )?;
-        let node = Self::decode_response_tree(
-            &mut state,
-            response.serialized,
-            true,
-            kind != "evaluateCandidatePreview",
-        )?
-        .ok_or_else(|| {
+        let node = Self::decode_response_tree(response.serialized, true)?.ok_or_else(|| {
             DecorationEvaluationError::RuntimeProtocol("missing composition tree".into())
         })?;
         let result = DecorationEvaluationResult {
@@ -468,38 +397,28 @@ impl DotNetDecorationEvaluator {
     }
 
     fn decode_response_tree(
-        state: &mut RuntimeState,
         wire: Option<super::super::WireDecorationNode>,
         required: bool,
-        quarantine: bool,
     ) -> Result<Option<super::super::DecorationNode>, DecorationEvaluationError> {
-        let result = (|| {
-            let Some(wire) = wire else {
-                return if required {
-                    Err(DecorationEvaluationError::RuntimeProtocol(
-                        "missing serialized composition tree".into(),
-                    ))
-                } else {
-                    Ok(None)
-                };
+        let Some(wire) = wire else {
+            return if required {
+                Err(DecorationEvaluationError::RuntimeProtocol(
+                    "missing serialized composition tree".into(),
+                ))
+            } else {
+                Ok(None)
             };
-            // Exactly the same conversion/structural validation as the TS wire path.
-            let node: super::super::DecorationNode = wire.try_into()?;
-            DecorationTree::new(node.clone())
-                .validate()
-                .map_err(|error| {
-                    DecorationEvaluationError::RuntimeProtocol(format!(
-                        "invalid composition tree: {error:?}"
-                    ))
-                })?;
-            Ok(Some(node))
-        })();
-        if let Err(error) = &result
-            && quarantine
-        {
-            state.quarantine(error.to_string());
-        }
-        result
+        };
+        // Same conversion/structural validation as the TS wire path.
+        let node: super::super::DecorationNode = wire.try_into()?;
+        DecorationTree::new(node.clone())
+            .validate()
+            .map_err(|error| {
+                DecorationEvaluationError::RuntimeProtocol(format!(
+                    "invalid composition tree: {error:?}"
+                ))
+            })?;
+        Ok(Some(node))
     }
 }
 
@@ -574,7 +493,7 @@ impl DecorationEvaluator for DotNetDecorationEvaluator {
             now_ms,
             None,
         )?;
-        let node = Self::decode_response_tree(&mut state, response.serialized, false, true)?;
+        let node = Self::decode_response_tree(response.serialized, false)?;
         if let Some(node) = &node {
             if let Some((_, cached)) = state.windows.get_mut(window_id) {
                 cached.node = node.clone();
@@ -610,7 +529,6 @@ mod tests {
         DecorationNodeKind, WindowAction, window_model::WindowPositionSnapshot,
     };
     use super::*;
-    use std::process::Command;
 
     fn snapshot() -> WaylandWindowSnapshot {
         let rect = WindowPositionSnapshot {
@@ -640,32 +558,6 @@ mod tests {
         }
     }
 
-    fn fake_worker(mode: &str) -> DotNetDecorationEvaluator {
-        let script = r#"
-import sys, json
-mode = sys.argv[1]
-for line in sys.stdin:
-    request = json.loads(line)
-    response = dict(requestId=request['requestId'], kind=request['kind'], ok=True)
-    if 'snapshot' in request:
-        response['serialized'] = dict(kind='WindowBorder', children=[
-            dict(kind='Label', props=dict(text=request['snapshot']['title'])), dict(kind='Window')])
-    if mode == 'id': response['requestId'] += 1
-    if mode == 'kind': response['kind'] = 'unknown'
-    if mode == 'missing': response.pop('serialized', None)
-    if mode == 'invalid': response['serialized'] = dict(kind='Box')
-    if mode == 'unsupported': response['serialized'] = dict(kind='Unknown')
-    if mode == 'json': print('bad json', flush=True)
-    else: print(json.dumps(response), flush=True)
-"#;
-        let mut command = Command::new("python3");
-        command.arg("-u").arg("-c").arg(script).arg(mode);
-        let evaluator = DotNetDecorationEvaluator::new(PathBuf::new(), PathBuf::new());
-        evaluator.state.lock().unwrap().transport =
-            Some(ExternalTransport::spawn(command).unwrap());
-        evaluator
-    }
-
     #[test]
     fn shared_snapshot_fixture_matches_actual_rust_wire() {
         let fixture: serde_json::Value =
@@ -675,61 +567,36 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn fake_worker_snapshot_to_existing_decoder_and_cache() {
-        let evaluator = fake_worker("ok");
-        evaluator.preload().unwrap();
-        let result = evaluator.evaluate_window(&snapshot(), 1234).unwrap();
-        DecorationTree::new(result.node.clone()).validate().unwrap();
-        let DecorationNodeKind::Label(label) = &result.node.children[0].kind else {
-            panic!("missing label");
-        };
-        assert_eq!(label.text, "Kitty 日本語");
-        assert!(
-            evaluator
-                .evaluate_cached_window("1", None, 1235, false)
-                .unwrap()
-                .node
-                .is_none()
-        );
-        assert!(
-            evaluator
-                .evaluate_cached_window("1", None, 1236, true)
-                .unwrap()
-                .node
-                .is_some()
-        );
-        evaluator.window_closed("1").unwrap();
-        assert!(
-            evaluator
-                .evaluate_cached_window("1", None, 1237, false)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn malformed_and_mismatched_responses_are_errors() {
-        for mode in ["id", "kind", "json", "missing", "invalid", "unsupported"] {
-            let evaluator = fake_worker(mode);
+    fn malformed_and_mismatched_json_responses_are_errors() {
+        for json in [
+            "bad json",
+            "{}",
+            r#"{"requestId":2,"kind":"evaluate","ok":true}"#,
+            r#"{"requestId":1,"kind":"unknown","ok":true}"#,
+        ] {
             assert!(
-                evaluator.evaluate_window(&snapshot(), 1).is_err(),
-                "accepted {mode} response"
+                DotNetDecorationEvaluator::decode_response(json.as_bytes(), "evaluate", 1).is_err()
             );
-            assert!(evaluator.state.lock().unwrap().transport.is_none());
         }
+        assert!(
+            DotNetDecorationEvaluator::decode_response(
+                br#"{"requestId":1,"kind":"evaluate","ok":true}"#,
+                "evaluate",
+                1
+            )
+            .is_ok()
+        );
     }
 
     #[test]
-    fn protocol_failure_quarantines_worker_without_respawn() {
-        let evaluator = fake_worker("id");
-        assert!(evaluator.preload().is_err());
-        assert!(evaluator.state.lock().unwrap().transport.is_none());
-        assert!(
-            evaluator
-                .preload()
-                .unwrap_err()
-                .to_string()
-                .contains("mismatched response")
-        );
+    fn invalid_tree_is_rejected() {
+        for json in [
+            r#"{"kind":"Box"}"#,
+            r#"{"kind":"WindowBorder","children":[]}"#,
+        ] {
+            let wire = serde_json::from_str(json).unwrap();
+            assert!(DotNetDecorationEvaluator::decode_response_tree(Some(wire), true).is_err());
+        }
     }
 
     fn handler_id(node: &super::super::super::DecorationNode) -> Option<&str> {
@@ -743,10 +610,10 @@ for line in sys.stdin:
 
     #[test]
     #[ignore = "build .NET projects and set SHOJI_TEST_DOTNET_RUNTIME / SHOJI_TEST_DOTNET_CONFIG"]
-    fn real_dotnet_worker_decodes_example_and_dispatches_delegate() {
+    fn real_dotnet_host_decodes_example_and_dispatches_delegate() {
         let evaluator = DotNetDecorationEvaluator::new(
             std::env::var_os("SHOJI_TEST_DOTNET_RUNTIME")
-                .expect("runtime apphost path")
+                .expect("runtime bootstrap DLL path")
                 .into(),
             std::env::var_os("SHOJI_TEST_DOTNET_CONFIG")
                 .expect("example assembly path")

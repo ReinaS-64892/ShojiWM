@@ -4,7 +4,7 @@ using ShojiWM.Wire;
 
 namespace ShojiWM.Runtime;
 
-/// Sequential assembly transaction manager. The NDJSON transport and file
+/// Sequential assembly transaction manager. The native ABI and file
 /// watcher are independent; only semantic commands reach this host.
 public sealed class ConfigurationHost : IDisposable
 {

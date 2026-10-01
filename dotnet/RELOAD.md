@@ -67,169 +67,120 @@ cleanup and pointer-worker reuse. `embedded_runtime.rs`, `evaluator.rs`, the
 TypeScript runtime/config and its native composition/scheduler paths are not
 modified for C# reload.
 
-## C# decision and lifecycle
+## C# in-process hosting decision
 
-Selected: **collectible configuration ALCs inside the existing external worker**.
-The CLR and transport stay alive across configuration reloads. The compositor
-continues to own Rust/Smithay state and never hosts CoreCLR. No hostfxr/nethost,
-backend traits, common language interfaces or new crate are introduced. TS/V8
-implementation and lifecycle are unchanged. Metadata Update and `dotnet watch`
-method patching are not used.
+CoreCLR is initialized by hostfxr through netcorehost 0.22.0. Only the permanent
+ShojiWM.Runtime.dll bootstrap exports native entry points; config DLLs remain
+collectible ALCs created by ConfigLoader. No common backend trait, upstream
+abstraction, plugin system or V8 redesign is introduced. ConfigurationHost,
+ConfigurationGeneration, RuntimeSession and the transaction commands retain
+their assembly lifecycle semantics. File monitoring/builds stay separate.
 
 ```mermaid
 flowchart TD
-    R[Running active assembly] -->|Shortcut or debounced edit| B[Build or stage immutable DLL dependencies]
+    R[Running active assembly] -->|Shortcut or debounced edit| B[Build or stage immutable dependencies]
     B -->|Failure| R
-    B -->|Success| I[Same worker: load candidate collectible ALC / OnEnable reload]
-    I -->|Exception| D[Dispose candidate / Unload / verify collection]
+    B -->|Success| I[Same managed host thread: prepare candidate ALC / OnEnable]
+    I -->|Exception| D[Dispose candidate / Unload / verify]
     D --> R
-    I --> V[Candidate preview / existing Rust decode and validation]
+    I --> V[Live snapshot preview / existing Rust decode and validation]
     V -->|Failure or superseded save| D
-    V -->|Success| S[Commit on existing compositor event loop]
-    S --> C[Switch session / old OnDisable / Dispose / Unload]
-    C --> W[Bounded collection / weak-reference verification]
-    W --> N[Running new assembly / invalidate decorations / redraw]
-    W -->|Still rooted| L[Log unload failure / reject further preparations]
+    V -->|Success| S[Compositor commit: switch managed session]
+    S --> C[Old OnDisable / Dispose / Unload]
+    C --> W[Weak-reference collection verification]
+    W --> N[Running new assembly / redraw]
+    W -->|Still rooted| L[Log / refuse subsequent preparations]
     L --> N
 ```
 
-Only initialization or recovery from worker death creates a worker process.
-Healthy reloads retain the same worker PID and pipes, with monotonically
-increasing request IDs. The JSON envelope adds optional `configPath` generated
-from the Rust serde source. Semantic commands are `prepareAssembly`,
-`evaluateCandidatePreview`, `commitAssembly`, `abortAssembly` and
-`shutdownAssemblies`; no CLR object/delegate/function pointer crosses the wire.
-Normal render, lifecycle, handler and tree JSON remains compatible.
+## Ownership and responsibilities
 
-Preparation runs on the existing background reload thread. It stages/builds
-config dependencies, asks the managed host to load and enable a candidate, and
-validates cached live window snapshots through the existing Rust decoder.
-Candidate previews suppress window actions and live callback registration.
-Normal evaluations/handlers continue to target the active session until commit.
-A Rust RAII pending lease aborts candidates rejected by validation, newer source
-content, event delivery failure or cancellation. The old DLL directory remains
-available throughout preparation. At commit, Rust clears old cached trees and
-marks decorations dirty; generation-specific handler IDs reject stale callbacks.
-
-Build, missing/broken assembly, entry-point, constructor, enable and preview
-exceptions retain the active assembly. Managed exceptions become strings with
-stage information (`assemblyLoad`, `initialization`, `reload`, `unload`) rather
-than retained user Exception/Type instances. Cleanup errors go to stderr;
-`OnDisable` failure still runs config disposal, and does not roll back a committed
-new config. Incomplete ALC collection is reported explicitly and blocks further
-preparations, preventing accumulation; collection can be retried after external
-references are released.
-
-## Responsibility and dependency separation
-
-| File / module | Responsibility / dependencies |
-|---|---|
-| `ssd/dotnet/transport.rs` | Worker startup/termination and bounded NDJSON pipe I/O; standard library only. |
-| `ssd/dotnet/assembly.rs` | Private immutable dependency staging and RAII directory cleanup; standard library only. |
-| `ssd/dotnet/source.rs` | Source fingerprinting/build and .NET-specific path/options DTO; no compositor types or ALC commands. |
-| `ssd/dotnet/reload.rs` | Serialized preparation/debounce and calloop publication; existing .NET integration glue. |
-| `ssd/dotnet/protocol.rs` | Wire envelope; reuses existing ShojiWM snapshots, actions and tree DTOs. |
-| `ssd/dotnet/evaluator.rs` | Existing DecorationEvaluator adapter, tree decode/validation, pending transaction lease, cache and error conversion. |
-| `ConfigurationHost.cs` | Owns active/candidate generation, prepares/commits/aborts and verifies unload. No file watching or transport. |
-| `ConfigurationGeneration.cs` | Owns loader and session; releases managed references, disables/disposes and requests unload. |
-| `ConfigLoader.cs` | Collectible ALC, dependency resolver, shared API identity and native dependency loading. |
-| `RuntimeSession.cs` | Per-generation config, window snapshots, delegate registry and action buffer. |
-| `Program.cs` / `NdjsonTransport.cs` | Long-lived worker protocol loop and framing; no watcher or source build. |
-
-The portable Rust operations are localized for later movement. Protocol/evaluator
-still intentionally reference core snapshots/decoder, and the reload publisher
-uses calloop; those are the existing integration edges, not an invented upstream
-abstraction. CLI/runtime selection and public `IWindowConfig` are unchanged.
-There is no new independent crate, backend/plugin discovery or generic backend
-API. Runtime hosting remains OS child-process ownership: hostfxr-specific handle
-layers would serve no purpose in this architecture.
-
-## Resource ownership and unload
-
-| Resource | Creator / owner | Release / reload lifetime |
+| Resource | Owner | Lifetime / release |
 |---|---|---|
-| Worker child + pipe thread/FDs | Rust transport | Survives healthy reload; bounded termination/reap on failure or final drop. |
-| Config/dependency stage | Rust assembly directory/evaluator | Candidate drop or last old evaluator reference after commit removes it. |
-| ALC / resolver | Managed generation | `Unload()` after config/session cleanup; only weak references retained for verification. |
-| Config / session | Managed generation | Active until switch; disable/dispose, clear references and detach before unload. |
-| Handler delegates / window cache | RuntimeSession | Cleared on window close/disable/dispose; generation IDs never reused. |
-| Config timers/tasks/threads/events/singletons | User config | User must cancel/await/join/unsubscribe/dispose; host calls `IAsyncDisposable` or `IDisposable` (async wins). |
-| Config native dependencies | ALC via AssemblyDependencyResolver | Runtime owns library lifetime loaded via `LoadUnmanagedDllFromPath`; user owns any separate handles. |
-| GCHandle / native callbacks / function pointers | None created by production bridge | Arbitrary config-created handles must be released by config disposal; never sent to Rust. |
-| Assembly/Type/MethodInfo | Temporary loader locals | No managed entry-point/reflection cache is retained in the host. |
+| hostfxr / CoreCLR | Rust bootstrap initialization | Process lifetime. hostfxr retained permanently; context close is not CLR shutdown. No dlclose/restart. |
+| Bootstrap function pointers / API assembly | Permanent managed bootstrap and Rust OnceLock | Process lifetime. No native pointer into a user config DLL. Bootstrap path changes require compositor restart. |
+| Managed host thread / Rust channel | InProcessDotNetHost | Backend host lifetime. Init/create/invoke/destroy occur on this thread, destruction joins it. No execution timeout/abandonment. |
+| GCHandle → HostOwner → ConfigurationHost | Managed CreateHost, Rust RAII owns opaque handle | Freed in DestroyHost finally after Dispose, on the creating thread. |
+| Request bytes | Rust | Borrowed by managed entry point only until call return. |
+| Response/error buffer | Managed NativeMemory.Alloc | Rust copies; RAII invokes managed FreeBuffer on all returned buffers. |
+| Config/dependency staging | Rust GenerationDirectory/evaluator | Lives through abort/disposal; removed after last generation reference. |
+| Active/candidate config/session/ALC | ConfigurationGeneration | Switch/abort/shutdown clears references, disables, disposes and calls Unload; only weak references retained afterward. |
+| Window snapshots/handler delegates | RuntimeSession | Cleared on close/disable/disposal; generation IDs reject stale callbacks. |
+| Timers/tasks/threads/events/GCHandles/native callbacks | User config | Must cancel/await/join/unsubscribe/free in IDisposable/IAsyncDisposable (async takes precedence). |
+| Assembly/Type/MethodInfo / exception objects | Managed call frames | Not cached across unload; diagnostics flatten to strings and frames unwind before GC verification. |
+| Source watcher/builds | Rust source/reload modules | Poll100ms, debounce400ms, one build/pending activation; build subprocess timeout120s/cancellation kills its own process group. |
+| Wayland/Smithay/output/window/focus/render/input | Existing compositor | Unchanged; survives config generations, decorations invalidated at commit. |
 
-A partially failed `OnEnable` is disabled and disposed. Constructors that throw
-must release resources they created before throwing. Config `OnDisable` remains
-the existing semantic hook; optional BCL disposal adds cleanup without changing
-the core configuration API. External effects and shared public-API/host statics
-are not transactionally restored. User code must not place config references in
-long-lived shared statics without disposing them.
+Bootstrap loading and errors are confined to host.rs. Immutable staging is in
+assembly.rs; source hashing/builds in source.rs; build group termination in
+process.rs. Evaluator/protocol and calloop reload publication remain the narrow
+existing ShojiWM integration edges. No backend implementation crate was split.
+NativeHost.Tests is only a CI harness importing the production hosting source.
 
-ALC unload is cooperative. Non-inlined load/release/exception frames unwind
-before weak-reference verification so JIT stack locals and user exceptions do
-not produce false unload failures. Weak references track resurrection. At most
-three collect/finalizer/collect passes occur at lifecycle boundaries; ordinary
-rendering never forces GC. This follows Microsoft's
+## Rollback and cooperative unload
+
+Build, missing/broken/no-entry DLL, constructor, OnEnable, preview exceptions and
+invalid Rust trees retain the active generation. A pending RAII lease aborts
+unactivated candidates (including superseded saves). Preview emits no live
+actions/handlers. Commit clears Rust caches and switches sessions before old
+disable/disposal. Cleanup exceptions are reported; they do not roll back a
+successful commit. Partially failing enable is disabled/disposed; throwing
+constructors clean their own partially allocated resources.
+
+Non-inlined load/release frames unwind before weak-reference verification;
+WeakReference tracks resurrection. Up to three GC/finalizer/GC passes occur at
+lifecycle boundaries, never ordinary rendering. Pending roots cause diagnostics
+and prepare refusal rather than accumulating generations. Release the root to
+permit collection/retry. This remains cooperative, following Microsoft's
 [assembly unloadability guidance](https://learn.microsoft.com/en-us/dotnet/standard/assembly/unloadability).
 
-There is no guarantee that arbitrary user code unloads: stuck tasks, leaked
-subscriptions/handles, or non-returning disposal/finalizers can retain an ALC or
-wedge the worker. Rust retains its existing 2 s protocol deadline, then terminates
-the worker and reports an error instead of deadlocking the compositor. Such a
-worker cannot preserve the old config; manual reload or a watched edit starts
-another worker. There is no automatic crash restart loop. Final process shutdown
-has a best-effort 100 ms cleanup budget. Build cancellation/deadline (120 s),
-process-group cleanup, source polling (100 ms), debounce (400 ms) and exclusion
-rules remain unchanged.
+C# configuration runs in the compositor process. The old pipe deadlines,
+worker kill/restart and 100ms final worker cleanup budget are removed. Rust
+cannot safely kill a managed thread or unload CoreCLR. A stuck callback,
+constructor, disposal or finalizer can block the host/compositor; native crashes,
+FailFast and Environment.Exit share ShojiWM's fault domain. Ordinary exceptions
+are contained by ConfigurationHost/NativeEntryPoint; no managed exception can
+unwind through the native entry point. Shared statics/side effects are not
+transactionally restored. Bootstrap/ABI/protocol failures do not start a CLR
+restart loop; errors explicitly require a ShojiWM restart.
 
 ## Verification
 
-Verified on 2026-10-01 inside the sandbox with .NET SDK 10.0.112:
+Headless tests require no Wayland session. Commands are in [README.md](README.md).
+The native host harness checks real hostfxr/runtimeconfig/bootstrap exports and
+API identity, 20 same-host reloads, action dispatch, old handler rejection,
+constructor/enable/render/broken/missing/no-entry rollback, output/input limits,
+deliberate leaked event rooting/refusal/release/retry, no worker children and
+one managed caller thread across multiple Rust callers.
 
-- **PASS** Release managed build: zero warnings/errors; 16 BCL-only tests.
-- **PASS** `cargo build -p shoji_wm --offline`: normal compositor binary, no warnings.
-- **PASS** Binding-generator freshness and 3 generator tests.
-- **PASS** Actual worker NDJSON test with 12 same-process assembly reloads.
-- **PASS** `cargo test --workspace --offline`: compositor 247 passed, 0 failed,
-  3 ignored; other workspace tests/doc-tests passed.
-- **PASS** Both opt-in .NET integration tests were also executed separately,
-  including actual source rebuild/rollback and unchanged PID on healthy reload.
+Managed tests check actual WeakReference collection after 20 swaps, exactly-once
+disposal, and config-owned Task/thread/timer/event/GCHandle cleanup. The native
+ABI tests check borrowed UTF-8 inputs, allocator-matched frees, null/invalid
+inputs, requestId preservation and exception containment. Rust unit tests
+check DTO fixture compatibility, correlation/tree validation, immutable stages,
+source hash exclusions and build process-group cancellation. Opt-in compositor
+integration tests check source rebuild success, syntax/initialization/tree
+rollback, 15 rapid saves/one pending activation, candidate lease abort and 12
+shared-host replacements with old staging directory removal.
 
-The tests run headlessly; no real Wayland session is needed.
+Visual WInit/TTY execution, long-running RSS/native handle trends, and arbitrary
+user native libraries are not covered by these headless tests. ALC collection
+and fixture resource teardown do not prove every config can unload.
 
-| Result | Test | Verification |
-|---|---|---|
-| PASS | Managed repeated reload | 20 switches in one host; previous ALC weak references are collected, old handler IDs fail, shutdown disposes all 21 generations exactly once. |
-| PASS | Managed resource fixture | Config owns a timer, cancellation-backed Task, thread, AppDomain event and GCHandle; disposal stops/releases all and ALC verification succeeds. |
-| PASS | Managed failure/retry | Missing/broken DLL, no config entry point, constructor/enable/render exception preserve old tree; fixes reload; throwing disable still disposes/unloads. |
-| PASS | Managed deliberate leak | Retained external event roots old ALC; diagnostic and prepare refusal; releasing reference permits collection/retry. |
-| PASS | Python actual worker | 12 assembly replacements in one process, NDJSON requestId correlation, unique handler IDs, no unload warning. |
-| PASS | Rust fake worker | 12 same-PID switches, rejected init/tree keep old PID/tree, cancelled pending lease aborts and removes staging. |
-| PASS | Rust watcher | 15 rapid saves debounce to latest config; only one activation before acknowledgment. |
-| PASS | Rust actual SDK build | Source edit changes decoded label with unchanged worker PID; syntax/enable errors preserve config; fixed source recovers; killed worker can be restarted. |
+Verified on 2026-10-01 inside the sandbox with SDK 10.0.112:
 
-Commands:
+| Result | Check |
+|---|---|
+| PASS | Release managed build, zero warnings/errors; 15 managed tests including native ABI calls. |
+| PASS | Actual hostfxr native harness: 20 swaps, rollback, leak/refusal/release/retry, output size rejection, same caller thread, no child workers; legacy apphost spelling resolves the DLL. |
+| PASS | Rust .NET unit tests: 7 passed, 2 opt-in integrations ignored in the ordinary run. |
+| PASS | Both opt-in compositor integrations executed separately: real decoder/layout/delegate actions and SDK source rebuild/rollback/rapid saves/staging cleanup. |
+| PASS | Workspace tests: compositor 241 passed, zero failures, 3 ignored; other crates/doc tests passed. |
+| PASS | `cargo build -p shoji_wm --offline`, no warnings; normal debug binary updated. |
+| PASS | Generated DTO freshness and 3 binding-generator tests. |
+| NOT RUN | Visual WInit/TTY run, long-running RSS/native resource measurements, Nix build. |
 
-```sh
-dotnet build dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj -c Release --disable-build-servers -m:1
-dotnet run --project dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj -c Release --no-build
-python3 tools/test-dotnet-worker.py --configuration Release
-python3 tools/generate-dotnet-bindings.py --check
-python3 tools/test-dotnet-generator.py
-cargo test -p shoji_wm 'ssd::dotnet'
-SHOJI_TEST_DOTNET_RUNTIME="$PWD/dotnet/ShojiWM.Runtime/bin/Release/net10.0/ShojiWM.Runtime" \
-  cargo test -p shoji_wm real_dotnet_source_reload -- --ignored --nocapture
-```
-
-**NOT RUN:** the driver-dependent EGL retirement test, a visual TTY/WInit
-reload and a long-running compositor RSS benchmark. C# keybindings/event subscriptions/scheduler APIs are not yet
-public APIs; config-owned BCL resources are tested instead.
-
-## Follow-ups
-
-Measure real compositor reload latency/RSS and add display smoke coverage.
-Capability/version negotiation and persisted config state are still follow-ups.
-The worker and shared API contract require a host rebuild/restart when changed;
-only user assemblies and their private dependencies reload. Native handles and
-external services need user cleanup contracts. Keep the current integration edges
-until upstream defines its abstraction; only then select the crate/API boundary.
+The workspace run preceded the final apphost-name regression test; that added
+case passed in the subsequent .NET unit run and actual hosting harness. Ignored
+.NET integrations were explicitly executed; the remaining ignored EGL/graphics
+check was not run. Expected unload diagnostics come from deliberate leak tests.

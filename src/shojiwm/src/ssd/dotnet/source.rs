@@ -1,5 +1,5 @@
 //! Source observation and serialized build inputs; no assembly/CLR lifecycle.
-use super::transport::terminate_child;
+use super::process::terminate_child;
 use std::os::unix::process::CommandExt;
 use std::{
     collections::hash_map::DefaultHasher,
@@ -16,7 +16,6 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 pub struct ReloadOptions {
-    pub executable: PathBuf,
     pub config: PathBuf,
     pub project: Option<PathBuf>,
     pub watch_root: PathBuf,

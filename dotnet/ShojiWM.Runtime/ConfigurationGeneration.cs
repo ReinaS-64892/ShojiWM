@@ -2,7 +2,7 @@ using System.Runtime.CompilerServices;
 
 namespace ShojiWM.Runtime;
 
-/// Owns one config ALC and its session; never owns the worker or transport.
+/// Owns one config ALC and its session; never owns CoreCLR or the native host thread.
 internal sealed class ConfigurationGeneration
 {
     private ConfigLoader? loader;

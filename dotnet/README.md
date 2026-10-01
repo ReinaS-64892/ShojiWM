@@ -1,39 +1,61 @@
 # C# runtime backend (MVP)
 
-ShojiWM still uses Rust/Smithay for the compositor, renderer and input. The
-TypeScript runtime remains the default. The opt-in .NET worker runs a user
-config assembly in a separate process and returns existing decoration trees.
-No CoreCLR hosting, P/Invoke, ASP.NET, or external NuGet packages are used.
+ShojiWM's opt-in .NET backend hosts CoreCLR **inside the Rust/Smithay compositor
+process**, using hostfxr and `netcorehost 0.22.0`. TypeScript is still the default;
+its RustyScript/V8 native paths and configuration lifecycle are unchanged.
+No ASP.NET or external managed NuGet dependency is used.
+
+```text
+ShojiWM process
+  Rust compositor → Rust channel → dotnet-runtime thread
+                                    hostfxr / CoreCLR
+                                      ShojiWM.Runtime.dll (permanent bootstrap)
+                                        ConfigurationHost
+                                          active/candidate collectible config ALCs
+```
 
 ## Build and run
 
-Install .NET SDK 10, Python 3, and the compositor's existing Rust dependencies.
-The worker needs only `Microsoft.NETCore.App` at runtime. On Arch, the split SDK
-packaging may also request `aspnet-targeting-pack` during restore; it is an SDK
-pack, not an application/framework dependency of this runtime.
-
-From the repository root:
+Install .NET SDK 10, Python 3 and the existing Rust/compositor dependencies.
+The running backend needs `Microsoft.NETCore.App` and installed hostfxr.
 
 ```sh
 python3 tools/generate-dotnet-bindings.py
-dotnet build dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj --disable-build-servers -m:1
-cargo build -p shoji_wm
+dotnet build dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj -c Release --disable-build-servers -m:1
+cargo build -p shoji_wm --offline
 ./target/debug/shoji_wm --runtime dotnet \
-  --decoration-runtime "$PWD/dotnet/ShojiWM.Runtime/bin/Debug/net10.0/ShojiWM.Runtime" \
-  --config "$PWD/dotnet/ShojiWM.Example/bin/Debug/net10.0/ShojiWM.Example.dll"
+  --decoration-runtime "$PWD/dotnet/ShojiWM.Runtime/bin/Release/net10.0/ShojiWM.Runtime.dll" \
+  --config "$PWD/dotnet/ShojiWM.Example/bin/Release/net10.0/ShojiWM.Example.dll"
 ```
 
-The existing `--config` and `--decoration-runtime` flags select the assembly and
-worker executable. Their existing `SHOJI_CONFIG` / `SHOJI_DECORATION_RUNTIME`
-fallbacks also apply. `--runtime typescript` or omitting `--runtime` preserves
-the existing TypeScript configuration and V8 fast paths. `--runtime dotnet`
-requires an explicit config assembly path. A worker executable named
-`ShojiWM.Runtime` on PATH is used when `--decoration-runtime` is omitted. Use the
-apphost executable, not the runtime DLL, for that argument.
+`--decoration-runtime` / `SHOJI_DECORATION_RUNTIME` now specify the managed
+**bootstrap DLL**, not an executable. Its directory must contain
+`ShojiWM.Runtime.runtimeconfig.json`, `ShojiWM.Runtime.deps.json`, `ShojiWM.dll`
+and bootstrap dependencies. The SDK library build generates these files.
+The previous extensionless apphost spelling resolves its sibling `.dll` for
+compatibility; it is never executed. If omitted, `ShojiWM.Runtime.dll` is located
+in the working directory or PATH. `--config` / `SHOJI_CONFIG` still select a user
+config DLL. No new CLI switch is introduced.
 
-The .NET example decorates each window with its title/app ID, a focus-colored
-border, and a close button that calls a C# delegate. The Rust compositor handles
-layout, drawing, move/resize hit testing, and applying the emitted close action.
+Hostfxr discovery uses explicit `DOTNET_ROOT` exclusively when set. Otherwise
+it checks the resolved PATH `dotnet` directory, then `/usr/share/dotnet`,
+`/usr/lib/dotnet` and `/opt/dotnet`, selecting the highest installed stable numeric
+version under `host/fxr`. Set `DOTNET_ROOT` for custom installations or Nix.
+The runtimeconfig selects the required framework version; finding hostfxr alone
+does not guarantee that .NET 10 is installed.
+
+`netcorehost` has default features disabled and only the `net8_0` API feature
+(which includes the runtimeconfig and UnmanagedCallersOnly APIs used here).
+It hosts .NET 10 through the runtimeconfig. Neither `nethost` nor
+`nethost-download` is enabled: no build script downloads native hosting assets.
+As for other Cargo dependencies, a fresh machine must fetch/vendor the pinned
+Cargo.lock dependencies once before `cargo build --offline`. Nix's existing
+cargoLock supplies them; no system nethost link input is required. An optional
+`dotnetRuntime` parameter in `nix/package.nix` sets the wrapper's DOTNET_ROOT;
+otherwise provide it in the launch environment and build the managed DLLs
+separately. The Nix derivation does not build/package C# configurations.
+
+The example uses title/app ID, focus-colored borders and a delegate close button.
 
 ### Displaying an application
 
@@ -66,8 +88,7 @@ env -u DISPLAY WAYLAND_DISPLAY=wayland-2 kitty
 Use a locally installed Wayland terminal (for example `foot`) if `kitty` is not
 installed. This command inherits `XDG_RUNTIME_DIR`; it must be the same directory
 used by ShojiWM. The C# title bar and close button appear around that application.
-Ordinary worker/config console messages go to the compositor's terminal stderr,
-not its Rust tracing log. Capture stderr separately when diagnosing the worker.
+Config Console output uses the process's normal stdout/stderr; no stream carries protocol data. Managed host diagnostics use stderr, separately from Rust tracing.
 
 ### Starting from a real TTY
 
@@ -75,7 +96,7 @@ Log in as your normal user on a free virtual terminal, then run from the repo:
 
 ```sh
 ./target/debug/shoji_wm --tty --runtime dotnet \
-  --decoration-runtime "$PWD/dotnet/ShojiWM.Runtime/bin/Debug/net10.0/ShojiWM.Runtime" \
+  --decoration-runtime "$PWD/dotnet/ShojiWM.Runtime/bin/Debug/net10.0/ShojiWM.Runtime.dll" \
   --config "$PWD/dotnet/ShojiWM.Example/bin/Debug/net10.0/ShojiWM.Example.dll" \
   2>/tmp/shoji-dotnet-stderr.log
 ```
@@ -96,7 +117,7 @@ different temporary directory for each process. If the error specifically names
 a missing D-Bus session, run the same compositor command under `dbus-run-session`.
 Neither setting creates a graphical parent display for WInit; `--tty` is still
 needed. Read both `latest.log` and `/tmp/shoji-dotnet-stderr.log` for seat/GPU or
-worker errors. Launch the demo client from a second terminal/TTY with the socket
+managed hosting errors. Launch the demo client from a second terminal/TTY with the socket
 name and runtime directory from the log; no C# launch key binding exists yet.
 
 ## Write a config
@@ -129,80 +150,45 @@ public sealed class MyConfig : IWindowConfig
 }
 ```
 
-Build the library and pass its DLL to `--config`. Keep its dependencies and
-`.deps.json` beside the DLL. The worker uses `AssemblyDependencyResolver` and a
-collectible `AssemblyLoadContext`, sharing the public `ShojiWM` assembly identity
-with the host. Config code never runs in the compositor process. The worker stays alive during
-reload: each configuration generation uses its own collectible ALC and an
-immutable copy of the config and adjacent dependencies. New generations are
-loaded and validated before the host switches sessions and unloads the old ALC.
+Build the library and pass its DLL to `--config`. Keep dependencies and
+`.deps.json` beside it. `ConfigLoader` uses `AssemblyDependencyResolver` and a
+collectible ALC, sharing `typeof(IWindowConfig).Assembly` from the permanent
+bootstrap; user config is **never** passed to hostfxr's function-pointer loader.
+Rust stages immutable dependency copies for generation lifetime.
 
-For config-owned tasks, threads, timers, external events or managed/native
-handles, implement `IDisposable` or `IAsyncDisposable`. The host calls
-`OnDisable("reload")`, clears session callbacks/snapshots, then disposes the config
-before requesting ALC unload. If both disposal interfaces exist, asynchronous
-disposal takes precedence. Cancel and await/join background work, unsubscribe
-external events and release handles there. `OnDisable` exceptions are reported
-but do not skip disposal. Failed `OnEnable` also receives cleanup. A constructor
-that throws is responsible for any resources created before it throws.
+Implement `IDisposable` or `IAsyncDisposable` for owned resources. The host calls
+OnDisable, clears session callbacks/snapshots, disposes the config (async wins
+if both interfaces exist), requests ALC unload and verifies weak references.
+Cancel/await tasks, stop/join threads, dispose timers, unsubscribe external
+subscriptions and release handles. Failed enable also receives cleanup;
+constructors that throw must release their partially constructed resources.
 
-## Reload during development
+## Development reload
 
-`Super+Shift+R` reloads the DLL without restarting the compositor. If
-`--dotnet-project` is specified, it builds that project first. Build and assembly
-initialization failures retain the active runtime and display/log the error.
-Build failures include the last 8 KiB of compiler diagnostics in that report.
-
-For automatic rebuild after saving C# sources:
+`Super+Shift+R` reloads the DLL; with `--dotnet-project`, it builds first.
+Automatic source reload uses the existing .NET watcher with `--dev`:
 
 ```sh
-dotnet build dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj -c Release --disable-build-servers -m:1
-cargo build -p shoji_wm
 ./target/debug/shoji_wm --runtime dotnet --dev \
-  --decoration-runtime "$PWD/dotnet/ShojiWM.Runtime/bin/Release/net10.0/ShojiWM.Runtime" \
+  --decoration-runtime "$PWD/dotnet/ShojiWM.Runtime/bin/Release/net10.0/ShojiWM.Runtime.dll" \
   --config "$PWD/dotnet/ShojiWM.Example/bin/Release/net10.0/ShojiWM.Example.dll" \
   --dotnet-project "$PWD/dotnet/ShojiWM.Example/ShojiWM.Example.csproj"
 ```
 
-Add `--tty` for a TTY session. The initial DLL still needs the initial build
-above; subsequent builds go to temporary generation directories, not that DLL.
-`--config`'s filename must match the project's output assembly filename.
-Without `--dotnet-project`, `--dev` watches the DLL directory instead; rebuild
-the same Debug/Release DLL you passed to `--config` using your own build command.
-Without `--dev`, only the explicit shortcut triggers reload.
+The watcher polls every 100 ms, debounces for 400 ms, and serializes builds and
+pending activations. Source/project/props/targets/JSON/DLL changes under the
+project root trigger reload; bin/obj/Generated/git/build staging are excluded.
+Without a project it watches the config directory and stages already built DLLs.
+`dotnet build` still runs as a subprocess with a 120 s deadline and process-group
+cancellation; this is independent of in-process config execution. Failed builds
+include an 8 KiB diagnostic tail and keep the active config.
 
-The source watcher polls content every 100 ms, debounces saves for 400 ms,
-serializes builds, and discards candidates superseded during a build. By default
-it watches the nearest ancestor containing `Directory.Build.props` (the `dotnet`
-directory in this repository), or the project's own directory. `--runtime-dir`
-overrides the source watch root, useful for referenced projects elsewhere.
-It watches `.cs`, `.csproj`, `.props`, `.targets`, `.json`, and `.dll`, excluding
-`bin`, `obj`, `Generated`, `.git`, `node_modules`, `target`, and reserved
-`shoji-dotnet-*` staging directories.
-Changes outside that root need a manual reload. The worker host/public API must
-be rebuilt separately when its own code or binary contract changes.
-
-The existing worker loads a candidate ALC, calls `OnEnable("reload")`, and previews
-existing windows through the Rust tree decoder before commit. Build, assembly
-load, enable and preview exceptions discard the candidate and preserve the
-active config. Commit switches sessions, calls old `OnDisable("reload")`, disposes
-old resources, unloads the ALC and verifies collection using weak references.
-GC is forced only at these lifecycle boundaries (at most three passes), not on
-render turns. If an old ALC remains rooted, stderr reports an unload error and
-further preparations are rejected until it becomes collectible, avoiding an
-unbounded number of leaked generations. Already active decorations can continue.
-
-Statics inside collectible assemblies are reset; host/API statics and external
-side effects are outside the rollback contract. There is no state migration API
-yet. A crashed or unresponsive worker is quarantined; the reload shortcut or a
-subsequent watched edit starts a replacement worker. There is no automatic
-crash-restart loop. Builds have a 120 s deadline; protocol requests retain the
-existing 2 s deadline. Because candidate user code runs in the same worker,
-a stuck constructor/enable/dispose/finalizer can require terminating that worker;
-exception rollback does not promise to preserve a wedged worker.
-
-See [the reload architecture and verification report](RELOAD.md) for the exact
-TypeScript behavior, ownership boundary, and headless integration tests.
+Reload stays prepare → enable candidate → live-window preview/Rust validation →
+commit → disable/dispose old → unload/verify. Candidate errors or invalid trees
+abort the candidate; old config and live handlers remain. CoreCLR/bootstrap and
+the host thread are not recreated. An uncollected ALC is logged and subsequent
+prepares are refused until its roots are released. Bootstrap/API changes require
+a compositor restart. See [RELOAD.md](RELOAD.md) for ownership and test details.
 
 `WaylandWindow` exposes typed snapshot values and close/maximize/minimize/focus/
 fullscreen commands. `RenderContext` supplies time, preview status, and typed
@@ -215,44 +201,43 @@ String dimension keywords are represented on the wire but currently rejected
 by the existing Rust decoder. This is also a constraint of the TS wire path.
 Image paths are currently passed through; use absolute paths.
 
-## Runtime boundary and protocol
+## Native ABI and JSON
 
-The existing `DecorationEvaluator` trait and `DecorationRuntimeEvaluator` enum
-are the backend boundary. The enum now has `DotNet` alongside `Embedded` and
-`Static`. `EmbeddedDecorationEvaluator`/`EmbeddedRuntime` continue using
-RustyScript, deno_core and V8, with their native composition/effect/interaction/
-scheduler paths, native patches and effect caches intact. Their TS config
-import/preload, signal reconciliation, scheduler, lifecycle reload and handler
-registries are unchanged.
+`ssd/dotnet/host.rs` loads bootstrap-only `[UnmanagedCallersOnly]` exports through
+hostfxr. `ShojiWM.Runtime` is a library; no Program, NDJSON transport, stdin/stdout
+loop or config worker executable is present.
 
-The new `DotNetDecorationEvaluator` uses `ExternalRuntimeRequest` and
-`ExternalRuntimeResponse` from `ssd/dotnet/protocol.rs`. Pipe framing and process
-management are confined to `ssd/dotnet/transport.rs`. Managed assembly lifecycle
-lives in `ConfigurationHost` / `ConfigurationGeneration`; `RuntimeSession` and
-the host are independent of `NdjsonTransport`, so the same semantics can later use a socket
-or another transport.
+| Export | ABI / ownership |
+|---|---|
+| CreateHost | borrowed UTF-8 path + int32 length; out opaque pointer-sized GCHandle and error buffer; int32 status |
+| Invoke | opaque handle, borrowed UTF-8 JSON + int32 length; out response buffer + int32 length; int32 status |
+| DestroyHost | opaque handle; disposes host and frees GCHandle; out error buffer/status |
+| FreeBuffer | frees a buffer using the same managed allocator that created it |
 
-Protocol v1 is UTF-8 NDJSON over stdin/stdout, one synchronous response per
-request. All field names are camelCase, and `requestId` is an unsigned 64-bit
-integer echoed exactly. Config `Console.WriteLine` and worker logs are redirected
-to stderr before assembly loading; stdout carries protocol data exclusively.
-Binary writers to standard output from config code are outside this contract.
+Status 0 means successful ABI execution; -1 indicates an error with UTF-8 text,
+-2 indicates an error whose diagnostic could not be allocated. Invoke success
+can still contain semantic JSON `ok:false`. No managed exception unwinds through
+the ABI. Rust owns request bytes until return; managed allocates response/error
+buffers with `NativeMemory.Alloc`. Rust copies and invokes FreeBuffer via RAII,
+including error paths. Never use Rust/free() to release those pointers. The
+bootstrap GCHandle roots only ConfigurationHost/host ownership, not native
+config delegates. DestroyHost frees it even if disposal throws.
 
-```json
-{"requestId":42,"kind":"evaluate","snapshot":{"id":"1","title":"Kitty","...":"see fixtures/window.json for the full snapshot"},"windowId":"1","nowMs":1234,"displayState":{},"inputState":{}}
-```
+All initialization, bootstrap loading, host creation, rendering, handler/reload
+calls and destruction run on one Rust `dotnet-runtime` thread. Compositor/reload
+threads send requests through a Rust channel. This preserves sequential managed
+callback execution and thread affinity; config-owned async continuations/tasks
+still obey normal .NET scheduling. Native exports enforce host thread identity.
+Host destruction joins that thread. CoreCLR and loaded hostfxr are retained for
+process lifetime; closing the initialization context is not CLR shutdown.
 
-```json
-{"requestId":42,"kind":"evaluate","ok":true,"serialized":{"kind":"WindowBorder","nodeId":"root","props":{},"children":[{"kind":"Window","props":{},"children":[]}]},"actions":[]}
-```
-
-The snapshot above is abbreviated; the full required fields are generated from
-`WaylandWindowSnapshot`, and a complete example is in `fixtures/window.json`.
-`serialized` reuses the existing handler-response vocabulary. Its shape is
-`WireDecorationNode` (`kind`, optional `nodeId`, `props`, `children`).
-`ClientWindow` serializes as `Window`, as it does in TypeScript. Rust calls the
-existing `TryFrom<WireDecorationNode>` decode and `DecorationTree::validate`;
-there must be exactly one childless client slot.
+The existing `ExternalRuntimeRequest` / `ExternalRuntimeResponse` names and
+camelCase JSON representation remain. They now mean semantic JSON messages,
+not an external-process transport. There is no newline framing. The 8 MiB limit
+applies to input and output byte buffers. RequestId/kind correlation is checked.
+`serialized` remains a WireDecorationNode, decoded and validated with the same
+Rust path (exactly one childless Window client slot). No direct FFI DTO redesign
+or shared-language/backend trait was introduced.
 
 Supported requests:
 
@@ -270,45 +255,35 @@ Supported requests:
 | `evaluateCandidatePreview` | `snapshot` | Renders candidate for Rust validation without live registration/actions |
 | `commitAssembly` | none | Switches to candidate and disposes/unloads the previous generation |
 | `abortAssembly` | none | Disposes/unloads the candidate, retaining the active config |
-| `shutdownAssemblies` | none | Disposes/unloads all config generations before worker termination |
+| `shutdownAssemblies` | none | Disposes/unloads all config generations before host disposal |
 
-Requests include `nowMs`, `displayState`, and `inputState`. Successful responses
-contain `requestId`, `kind`, `ok: true`, optional `serialized`/`invoked`, and
-`actions` using the existing `RuntimeWindowAction` JSON. Failures use `ok: false`
-and `error`. Candidate load/initialization/render rejection is a correlated semantic error and
-does not quarantine the worker. Unknown kinds and malformed requests produce a failure response;
-if a malformed envelope has a readable ID/kind, those are preserved. Completely
-unparseable JSON returns ID 0 / `protocolError`.
+Failures use a correlated `ok:false` and error string. Unparseable JSON returns
+ID 0 / protocolError. Normal managed exceptions keep the host usable; protocol
+or ABI failures are reported without a worker quarantine/restart loop.
+Handler descriptors remain `{ "kind":"runtime-handler", "id":"handler-…" }`;
+IDs are window/path stable within a generation and cannot invoke a newer
+session's delegate. Preview suppresses commands/live registration. Rust caches
+evaluations and does not reapply consumed actions. Full C# scheduler/reactivity,
+keybindings, output/workspace management, shaders/animation and proactive dirty
+notifications remain outside the MVP; no C# APIs were generalized in this change.
 
-Callbacks serialize to the existing descriptor
-`{"kind":"runtime-handler","id":"handler-42"}`. IDs stay stable at a
-window/tree path while that handler remains present, and are scoped to the
-window in dispatch. Preview does not replace live registrations. Rendering
-replaces obsolete delegates; window close/lifecycle disable releases them.
-The MVP assumes synchronous config/delegate execution on the worker thread.
+## Fault domain
 
-Rust caches the last decoded evaluation. An unchanged cached request returns
-no tree and emits no previously consumed actions. Changed snapshots and forced
-reevaluations render a complete tree. Scheduler ticks currently use the trait's
-no-op implementation and send no IPC; there are no timers or proactive dirty
-notifications in the C# MVP.
-
-Messages are limited to 8 MiB and decoded trees to the serializers' default
-depth limits. A Rust pipe thread bounds both blocked writes and reads with a
-two-second exchange deadline. On EOF, timeout, malformed response, ID/kind
-mismatch, or worker failure, the transport kills/reaps the worker and reports
-a runtime error. Protocol failures quarantine that generation until explicit
-reload or a watched edit, avoiding a process-spawn loop per frame. Existing compositor error/
-static-decoration fallback paths apply. Normal final evaluator drop attempts
-a bounded (100 ms) `shutdownAssemblies` before terminating the process; cleanup
-callbacks are best effort when the worker has failed.
+C# config now runs **in the compositor process**. There is no 2 s managed-call
+deadline, thread abandonment, worker kill/restart or CLR restart. A forever
+blocked constructor/callback/disposal/finalizer can block the host and compositor
+work waiting on it; native faults, Environment.FailFast or process exit can end
+ShojiWM. Exception rollback and cooperative ALC leak detection do not provide
+process fault isolation. Shared/static side effects are not transactionally
+restored. GC verification runs only at lifecycle boundaries, at most three
+collect/finalizer/collect passes; a nonreturning finalizer can still hang them.
 
 ## Binding generation
 
 The source of truth for this MVP is the existing Rust serde DTOs, because the
 actual decoder has narrower numeric/dimension/action semantics than the full
 reactive TypeScript API. `tools/generate-dotnet-bindings.py` follows the DTO
-dependency closure from the external envelope, through snapshots, props and
+dependency closure from the JSON envelope, through snapshots, props and
 styles, and generates `ShojiWM/Generated/Protocol.g.cs`. Generated files carry
 `// <auto-generated />` and are ignored by Git. Building the `ShojiWM` project
 runs the generator automatically, including on a clean checkout. Python 3 is
@@ -322,7 +297,7 @@ spellings. `Option<T>` becomes nullable, numbers retain Rust widths, and
 `Vec<u8>` becomes `List<byte>` to preserve JSON number arrays (C# `byte[]` would
 use base64).
 
-Handwritten: the public node/config/command API, process transport/session,
+Handwritten: the public node/config/command API, native bootstrap/session,
 assembly loader, and converters for the small untagged dimension/font/click/
 resize unions. Effects and animation payloads remain opaque `JsonElement` in
 the wire layer, without a supported public API. Primitive composition children
@@ -345,68 +320,42 @@ generator are versioned; generated C# output is not.
 ## Tests
 
 ```sh
-dotnet build dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj --disable-build-servers -m:1
-dotnet run --project dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj --no-build
-python3 tools/test-dotnet-worker.py
-cargo test -p shoji_wm
-cargo test --workspace
+dotnet build dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj -c Release --disable-build-servers -m:1
+dotnet run --project dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj -c Release --no-build
+python3 tools/generate-dotnet-bindings.py --check
+python3 tools/test-dotnet-generator.py
+cargo test -p shoji_wm --offline 'ssd::dotnet'
+cargo test --workspace --offline
+cargo build -p shoji_wm --offline
 ```
 
-When running in a sandbox or a desktop session, isolate the default TS config's
-IPC socket from the session runtime directory and disable activation-environment
-publication for tests:
+Run the real hostfxr test harness (no Wayland/V8 build needed):
 
 ```sh
-install -d -m 700 /tmp/shoji-runtime-tests
-XDG_RUNTIME_DIR=/tmp/shoji-runtime-tests SHOJI_PUBLISH_ACTIVATION_ENV=0 cargo test --workspace
+cargo run --locked --offline --manifest-path dotnet/NativeHost.Tests/Cargo.toml -- \
+  "$PWD/dotnet/ShojiWM.Runtime/bin/Release/net10.0/ShojiWM.Runtime.dll" \
+  "$PWD/dotnet/ShojiWM.Tests/bin/Release/net10.0/ShojiWM.Tests.dll"
 ```
 
-Socket tests still need an execution environment that permits Unix sockets.
+NativeHost.Tests is a test-only executable that compiles production host.rs by
+path, not a separated backend crate. CI runs it with .NET 10 and Rust installed.
+It checks 20 swaps, callback thread identity, handlers/actions, rollback,
+cooperative leak/refusal/root-release/retry, byte limits and absence of child
+processes. Managed tests additionally inspect WeakReference collection and
+resource disposal. Native export tests call UCO functions through function
+pointers and check exception containment/buffer frees.
 
-The .NET test executable requires no test-framework NuGet packages and returns
-a failing exit code on any assertion failure. It covers serialization,
-optionality, literal enum mapping, full `requestId` precision, composition,
-handler cleanup/stability, malformed/unknown messages, lifecycle, assembly
-loading, NDJSON, 20 same-process reloads, weak-reference ALC collection, rejected
-assembly/entry/initialization/render failures, managed resource cleanup, and
-unload-leak detection/refusal. Python tests the actual worker process. Rust fake workers
-test existing decoding/validation, caching, malformed/mismatched responses,
-worker death, and blocked stdin without needing a Wayland session.
-
-Run the opt-in Rust → actual C# → existing Rust decoder integration test after
-building the .NET projects:
+The compositor integration tests exercise the real existing Rust decoder/layout,
+source build/watcher/rollback, invalid trees, staging lifetimes and shared host
+identity. Enable them explicitly (same bootstrap DLL path for both):
 
 ```sh
-SHOJI_TEST_DOTNET_RUNTIME="$PWD/dotnet/ShojiWM.Runtime/bin/Debug/net10.0/ShojiWM.Runtime" \
-SHOJI_TEST_DOTNET_CONFIG="$PWD/dotnet/ShojiWM.Example/bin/Debug/net10.0/ShojiWM.Example.dll" \
-cargo test -p shoji_wm real_dotnet_worker_decodes_example_and_dispatches_delegate -- --ignored
+SHOJI_TEST_DOTNET_RUNTIME="$PWD/dotnet/ShojiWM.Runtime/bin/Release/net10.0/ShojiWM.Runtime.dll" \
+SHOJI_TEST_DOTNET_CONFIG="$PWD/dotnet/ShojiWM.Example/bin/Release/net10.0/ShojiWM.Example.dll" \
+cargo test -p shoji_wm --offline 'ssd::dotnet' -- --ignored --nocapture --test-threads=1
 ```
 
-## Remaining work and performance
-
-Not ported: reactive signals/computed/state hooks, node reconciliation/patches,
-poll/timer scheduler, pointer/gesture callbacks, hover/active delegates,
-managed-window layout/state and animations, lifecycle persisted state,
-key bindings, workspace/output/input configuration, shader/effect API,
-process/env/IPC controllers, and asset resolution. This example is decoration
-composition with window commands, not a port of the default hybrid tiling WM.
-
-Next steps are a managed-window result/config API, scheduler dirty notification
-semantics, hover/active dispatch, and explicit lifecycle state migration.
-Reactive values should evaluate to ordinary DTO values; signal engine internals
-should stay out of the wire protocol. The existing shared DTO source can later
-move to a versioned protocol crate/schema if more backends need it.
-
-The .NET path serializes complete snapshots/trees and waits synchronously for
-IPC, so it has higher latency and allocations than the embedded V8 native
-paths. Even with bounded I/O, a slow config can stall a compositor turn for up
-to the deadline. Benchmark and introduce asynchronous evaluations/dirty batches
-before making this backend a default or targeting high-refresh workloads.
-Socket/binary framing and source-generated JSON serializers remain follow-ups.
-
-Before upstreaming beyond the MVP, agree on protocol capability/version
-negotiation, request deadlines/recovery policy, supported API scope, install/
-packaging locations, and whether the restricted generator should become a
-schema exporter. Keep the Rust/C# roundtrip test in a compositor CI job with the
-existing Smithay/V8 build dependencies; a real Wayland visual smoke test is
-still needed for release validation.
+Actual visual/TTY reload and long-running RSS measurements need separate
+manual validation. Future optimizations can reduce JSON allocations, use
+System.Text.Json source generation, or introduce direct FFI DTOs independently
+of this hosting change.

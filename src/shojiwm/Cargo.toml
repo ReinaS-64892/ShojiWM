@@ -84,6 +84,7 @@ icu_calendar = "=2.1.1"
 icu_normalizer = "=2.1.1"
 icu_properties = "=2.1.2"
 idna_adapter = "=1.2.1"
+netcorehost = { version = "=0.22.0", default-features = false, features = ["net8_0"] }
 
 [features]
 # Hardened allocator for chasing heap corruption:

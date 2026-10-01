@@ -1557,7 +1557,7 @@ impl ShojiWM {
         let dotnet_reload_manager =
             if let DecorationRuntimeEvaluator::DotNet(current) = &decoration_evaluator {
                 let paths = crate::install_paths::runtime_path_options();
-                let (executable, config) = crate::install_paths::dotnet_runtime_paths();
+                let (_, config) = crate::install_paths::dotnet_runtime_paths();
                 let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let config = cwd.join(config);
                 let project = paths.dotnet_project.map(|project| cwd.join(project));
@@ -1586,7 +1586,6 @@ impl ShojiWM {
                     .expect("Failed to register .NET reload event source");
                 match crate::ssd::dotnet::reload::DotNetReloadManager::start(
                     crate::ssd::dotnet::reload::ReloadOptions {
-                        executable,
                         config,
                         project,
                         watch_root,
@@ -2943,7 +2942,7 @@ impl ShojiWM {
         };
         let previous = previous.clone();
         // Preparation completed OnEnable and validated preview trees. The
-        // .NET-only commit switches the assembly in the same worker process.
+        // .NET-only commit switches the assembly in the same in-process managed host.
         self.sync_runtime_display_state();
         self.decoration_evaluator
             .sync_input_state(self.runtime_input_device_state().clone());
@@ -2964,7 +2963,7 @@ impl ShojiWM {
         if let Some(manager) = &self.dotnet_reload_manager {
             manager.activated(next.clone());
         }
-        if !previous.shares_worker_with(&next) {
+        if !previous.shares_host_with(&next) {
             previous.retire("reload");
         }
         self.runtime_scheduler_enabled = false;

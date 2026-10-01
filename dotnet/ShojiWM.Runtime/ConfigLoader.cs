@@ -17,7 +17,7 @@ public sealed class ConfigLoader : AssemblyLoadContext
 
     protected override Assembly? Load(AssemblyName name)
     {
-        // Config and worker must share the same public API assembly identity.
+        // Config and bootstrap must share the same public API assembly identity.
         if (name.Name == typeof(IWindowConfig).Assembly.GetName().Name) return typeof(IWindowConfig).Assembly;
         var dependency = resolver.ResolveAssemblyToPath(name);
         return dependency is null ? null : LoadFromAssemblyPath(dependency);

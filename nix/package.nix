@@ -31,6 +31,8 @@
   # a separate xwayland-satellite process instead (debugging, other branches).
   xwaylandSatellite ? null,
   rustyV8Archive ? callPackage ./rusty-v8.nix { },
+  # Optional in-process .NET runtime; C# assemblies are built/provided separately.
+  dotnetRuntime ? null,
 }:
 
 let
@@ -175,6 +177,11 @@ rustPlatform.buildRustPackage {
       --suffix __EGL_VENDOR_LIBRARY_DIRS : "${eglVendorLibraryDirs}"
       --set-default SHOJI_DECORATION_RUNTIME "$out/lib/shojiwm/tools/decoration-runtime.ts"
     )
+    ${lib.optionalString (dotnetRuntime != null) ''
+      shoji_wrapper_args+=(
+        --set-default DOTNET_ROOT "${dotnetRuntime}/share/dotnet"
+      )
+    ''}
     ${lib.optionalString (xwaylandSatellite != null) ''
       shoji_wrapper_args+=(
         --set-default SHOJI_XWAYLAND_SATELLITE_PATH "${xwaylandSatellite}/bin/xwayland-satellite"

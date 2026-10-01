@@ -1,7 +1,6 @@
 //! Generation preparation runs outside the compositor event loop. Only a
 //! validated generation is published; build/load failures leave the active
-//! evaluator untouched. A healthy worker prepares a collectible assembly; only
-//! initial load or crash recovery starts a new worker process.
+//! evaluator untouched. Reload always prepares on the existing managed host.
 #[cfg(test)]
 use super::super::DecorationEvaluator;
 use super::{
@@ -165,26 +164,12 @@ fn prepare_generation(
     } else {
         GenerationDirectory::copy_config(&options.config)?
     };
-    let next = if current.has_active_worker() {
-        current
-            .prepare_assembly(config, directory)
-            .map_err(|e| e.to_string())?
-    } else {
-        let next = DotNetDecorationEvaluator::for_generation(
-            options.executable.clone(),
-            config,
-            directory,
-        );
-        current
-            .copy_environment_to(&next)
-            .map_err(|e| e.to_string())?;
-        next.preload().map_err(|e| e.to_string())?;
-        let invocation = next.lifecycle_enable("reload").map_err(|e| e.to_string())?;
-        if !invocation.actions.is_empty() {
-            return Err("reload OnEnable returned unsupported window actions".into());
-        }
-        next
-    };
+    if !current.has_active_host() {
+        return Err("runtime host unavailable; ShojiWM restart required".into());
+    }
+    let next = current
+        .prepare_assembly(config, directory)
+        .map_err(|e| e.to_string())?;
     // Run the existing wire decoder and tree validation before retiring old.
     for snapshot in current.window_snapshots().map_err(|e| e.to_string())? {
         if stop.load(Ordering::Acquire) {
@@ -200,7 +185,7 @@ fn prepare_generation(
 mod tests {
     use super::super::super::{DecorationNode, DecorationNodeKind, WaylandWindowSnapshot};
     use super::*;
-    use std::{fs, path::Path, process::Command};
+    use std::{fs, path::Path};
 
     fn snapshot() -> WaylandWindowSnapshot {
         WaylandWindowSnapshot {
@@ -229,165 +214,6 @@ mod tests {
             return Some(&label.text);
         }
         node.children.iter().find_map(label)
-    }
-
-    fn fake_options() -> (Arc<GenerationDirectory>, ReloadOptions) {
-        use std::os::unix::fs::PermissionsExt;
-        let root = GenerationDirectory::create().unwrap();
-        let executable = root.path().join("worker.py");
-        fs::write(&executable, r#"#!/usr/bin/env python3
-import json, sys, os
-value = open(sys.argv[2]).read()
-candidate = None
-candidate_path = None
-for line in sys.stdin:
-    q = json.loads(line)
-    response = dict(kind=q['kind'], requestId=q['requestId'], ok=True)
-    if q['kind'] == 'prepareAssembly':
-        candidate_path = q['configPath']
-        candidate = open(candidate_path).read()
-        if candidate == 'init-error':
-            candidate = None
-            response.update(ok=False, error='initialization failed')
-    if q['kind'] == 'commitAssembly':
-        value, candidate = candidate, None
-    if q['kind'] == 'abortAssembly':
-        if candidate_path and not os.path.exists(candidate_path):
-            value = 'abort-lost-dependencies'
-            response.update(ok=False, error='candidate dependencies removed before cleanup')
-        candidate = None
-        candidate_path = None
-    text = candidate if q['kind'] == 'evaluateCandidatePreview' else value
-    if q['kind'] in ('evaluate', 'evaluatePreview', 'evaluateCandidatePreview'):
-        response['serialized'] = dict(kind='WindowBorder', props={}, children=[dict(kind='Label', props=dict(text=text), children=[]), dict(kind='Window', props={}, children=[])])
-        if text == 'bad-tree': response['serialized']['children'] = []
-    print(json.dumps(response), flush=True)
-"#).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let config = root.path().join("Config.dll");
-        fs::write(&config, "old").unwrap();
-        let options = ReloadOptions {
-            executable,
-            config,
-            project: None,
-            watch_root: root.path().into(),
-            dev: false,
-        };
-        (root, options)
-    }
-
-    #[test]
-    fn rejected_assembly_keeps_worker_and_twelve_swaps_release_staging() {
-        let (_root, options) = fake_options();
-        let stop = AtomicBool::new(false);
-        let mut current = DotNetDecorationEvaluator::new_shadowed(
-            options.executable.clone(),
-            options.config.clone(),
-        );
-        current.lifecycle_enable("initial").unwrap();
-        current.evaluate_window(&snapshot(), 0).unwrap();
-        let old_pid = current.test_process_id().unwrap();
-        for invalid in ["init-error", "bad-tree"] {
-            fs::write(&options.config, invalid).unwrap();
-            assert!(prepare_generation(&options, &current, &stop).is_err());
-            assert_eq!(current.test_process_id(), Some(old_pid));
-            assert_eq!(
-                label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
-                Some("old")
-            );
-        }
-        for generation in 0..12 {
-            let text = format!("generation-{generation}");
-            fs::write(&options.config, &text).unwrap();
-            let next = prepare_generation(&options, &current, &stop).unwrap();
-            next.activate_prepared().unwrap();
-            assert_eq!(
-                label(&next.evaluate_window(&snapshot(), 0).unwrap().node),
-                Some(text.as_str())
-            );
-            let old_pid = current.test_process_id().unwrap();
-            let old_directory = current.test_generation_path().unwrap();
-            drop(current);
-            assert_eq!(
-                next.test_process_id(),
-                Some(old_pid),
-                "reload restarted worker"
-            );
-            assert!(!old_directory.exists(), "retired staging directory leaked");
-            current = next;
-        }
-    }
-
-    #[test]
-    fn dropping_prepared_candidate_aborts_without_replacing_active_assembly() {
-        let (_root, options) = fake_options();
-        let current = DotNetDecorationEvaluator::new_shadowed(
-            options.executable.clone(),
-            options.config.clone(),
-        );
-        current.lifecycle_enable("initial").unwrap();
-        current.evaluate_window(&snapshot(), 0).unwrap();
-        fs::write(&options.config, "discarded").unwrap();
-        let next = prepare_generation(&options, &current, &AtomicBool::new(false)).unwrap();
-        let directory = next.test_generation_path().unwrap();
-        assert_eq!(current.test_process_id(), next.test_process_id());
-        assert_eq!(
-            label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
-            Some("old")
-        );
-        drop(next);
-        assert!(!directory.exists());
-        assert_eq!(
-            label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
-            Some("old")
-        );
-        fs::write(&options.config, "accepted").unwrap();
-        let next = prepare_generation(&options, &current, &AtomicBool::new(false)).unwrap();
-        next.activate_prepared().unwrap();
-        assert_eq!(
-            label(&next.evaluate_window(&snapshot(), 0).unwrap().node),
-            Some("accepted")
-        );
-    }
-
-    #[test]
-    fn watcher_debounces_rapid_saves_and_has_one_pending_activation() {
-        let (_root, mut options) = fake_options();
-        options.dev = true;
-        let current = DotNetDecorationEvaluator::new_shadowed(
-            options.executable.clone(),
-            options.config.clone(),
-        );
-        let (tx, rx) = smithay::reexports::calloop::channel::channel();
-        let manager = DotNetReloadManager::start(options.clone(), current, tx).unwrap();
-        // Let the initial fingerprint settle before simulating editor saves.
-        thread::sleep(Duration::from_millis(150));
-        for i in 0..15 {
-            fs::write(&options.config, format!("save-{i}")).unwrap();
-            thread::sleep(Duration::from_millis(20));
-        }
-        let start = Instant::now();
-        let next = loop {
-            match rx.try_recv() {
-                Ok(ReloadEvent::Ready(next)) => break next,
-                Ok(ReloadEvent::Failed(error)) => panic!("{error}"),
-                Err(_) if start.elapsed() < Duration::from_secs(5) => thread::sleep(POLL),
-                Err(error) => panic!("reload did not complete: {error:?}"),
-            }
-        };
-        assert_eq!(
-            label(&next.evaluate_window(&snapshot(), 0).unwrap().node),
-            Some("save-14")
-        );
-        manager.reload();
-        manager.reload();
-        thread::sleep(Duration::from_millis(600));
-        assert!(
-            rx.try_recv().is_err(),
-            "activated two generations without commit acknowledgement"
-        );
-        next.activate_prepared().unwrap();
-        manager.activated(next);
     }
 
     #[test]
@@ -423,19 +249,17 @@ public sealed class Config : IWindowConfig {{
         let initial = root.path().join("initial");
         let stop = AtomicBool::new(false);
         build_project(&project, &initial, &stop).unwrap();
+        let component: std::path::PathBuf = std::env::var_os("SHOJI_TEST_DOTNET_RUNTIME")
+            .expect("runtime bootstrap DLL path")
+            .into();
         let options = ReloadOptions {
-            executable: std::env::var_os("SHOJI_TEST_DOTNET_RUNTIME")
-                .expect("runtime apphost path")
-                .into(),
             config: initial.join("Config.dll"),
             project: Some(project),
             watch_root: root.path().into(),
             dev: true,
         };
-        let mut current = DotNetDecorationEvaluator::new_shadowed(
-            options.executable.clone(),
-            options.config.clone(),
-        );
+        let mut current =
+            DotNetDecorationEvaluator::new_shadowed(component, options.config.clone());
         current.lifecycle_enable("initial").unwrap();
         current.evaluate_window(&snapshot(), 0).unwrap();
         let (tx, rx) = smithay::reexports::calloop::channel::channel();
@@ -454,15 +278,11 @@ public sealed class Config : IWindowConfig {{
             let ReloadEvent::Ready(next) = event else {
                 panic!("expected successful reload")
             };
-            let old_pid = current.test_process_id().unwrap();
+            let previous = current.clone();
             next.activate_prepared().unwrap();
             *current = next.clone();
             manager.activated(next);
-            assert_eq!(
-                current.test_process_id(),
-                Some(old_pid),
-                "assembly reload restarted CLR"
-            );
+            assert!(current.shares_host_with(&previous));
         };
         activate(receive(), &mut current);
         current.evaluate_window(&snapshot(), 0).unwrap();
@@ -472,10 +292,10 @@ public sealed class Config : IWindowConfig {{
             label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
             Some("after:Kitty 日本語")
         );
-        let old_pid = current.test_process_id().unwrap();
+        let previous = current.clone();
         fs::write(&source, "this is not C# syntax").unwrap();
         assert!(matches!(receive(), ReloadEvent::Failed(error) if error.contains("build failed")));
-        assert_eq!(current.test_process_id(), Some(old_pid));
+        assert!(current.shares_host_with(&previous));
         assert_eq!(
             label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
             Some("after:Kitty 日本語")
@@ -484,29 +304,69 @@ public sealed class Config : IWindowConfig {{
         assert!(
             matches!(receive(), ReloadEvent::Failed(error) if error.contains("broken initialization"))
         );
-        assert_eq!(current.test_process_id(), Some(old_pid));
+        assert!(current.shares_host_with(&previous));
         fs::write(&source, config_source("recovered:", false)).unwrap();
         activate(receive(), &mut current);
         assert_eq!(
             label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
             Some("recovered:Kitty 日本語")
         );
-        // Unexpected worker death is a recoverable protocol error, then an
-        // explicit reload creates a fresh process, without a compositor restart.
-        Command::new("kill")
-            .args(["-KILL", &current.test_process_id().unwrap().to_string()])
-            .status()
-            .unwrap();
-        assert!(current.preload().is_err());
-        manager.reload();
-        let ReloadEvent::Ready(next) = receive() else {
-            panic!("worker crash recovery failed")
-        };
-        manager.activated(next.clone());
+        fs::write(&source, "using ShojiWM; public sealed class Config : IWindowConfig { public CompositionNode RenderWindow(WaylandWindow window, RenderContext context) => new WindowBorder(); }").unwrap();
+        assert!(
+            matches!(receive(), ReloadEvent::Failed(error) if error.contains("composition tree"))
+        );
         assert_eq!(
-            label(&next.evaluate_window(&snapshot(), 0).unwrap().node),
+            label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
             Some("recovered:Kitty 日本語")
         );
+        // Rapid source saves coalesce into a single serialized build and candidate.
+        for i in 0..15 {
+            fs::write(&source, config_source(&format!("save-{i}:"), false)).unwrap();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let ReloadEvent::Ready(next) = receive() else {
+            panic!("rapid saves failed")
+        };
+        assert!(current.shares_host_with(&next));
+        manager.reload();
+        manager.reload();
+        thread::sleep(Duration::from_millis(600));
+        assert!(
+            rx.try_recv().is_err(),
+            "second candidate prepared before activation acknowledgement"
+        );
+        next.activate_prepared().unwrap();
+        current = next;
+        assert_eq!(
+            label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
+            Some("save-14:Kitty 日本語")
+        );
+        // Stop the watcher before exercising transactions explicitly.
+        drop(manager);
+        drop(previous);
+        let mut staged_options = ReloadOptions {
+            config: current.test_generation_path().unwrap().join("Config.dll"),
+            project: None,
+            watch_root: root.path().into(),
+            dev: false,
+        };
+        let discarded = prepare_generation(&staged_options, &current, &stop).unwrap();
+        let discarded_path = discarded.test_generation_path().unwrap();
+        drop(discarded);
+        assert!(!discarded_path.exists());
+        assert_eq!(
+            label(&current.evaluate_window(&snapshot(), 0).unwrap().node),
+            Some("save-14:Kitty 日本語")
+        );
+        for _ in 0..12 {
+            let old_directory = current.test_generation_path().unwrap();
+            let next = prepare_generation(&staged_options, &current, &stop).unwrap();
+            assert!(current.shares_host_with(&next));
+            next.activate_prepared().unwrap();
+            current = next;
+            assert!(!old_directory.exists(), "old staging leaked");
+            staged_options.config = current.test_generation_path().unwrap().join("Config.dll");
+        }
     }
 
     #[test]
@@ -515,7 +375,6 @@ public sealed class Config : IWindowConfig {{
         let file = dir.path().join("Config.cs");
         fs::write(&file, "before").unwrap();
         let options = ReloadOptions {
-            executable: "worker".into(),
             config: "Config.dll".into(),
             project: Some("Config.csproj".into()),
             watch_root: dir.path().into(),

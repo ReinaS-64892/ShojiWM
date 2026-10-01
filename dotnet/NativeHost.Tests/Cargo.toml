@@ -1,0 +1,16 @@
+# Test-only harness: compiles the production hosting module without Smithay/V8.
+[package]
+name = "shoji-dotnet-host-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+netcorehost = { version = "=0.22.0", default-features = false, features = ["net8_0"] }
+serde_json = "1.0.140"
+
+[[bin]]
+name = "shoji-dotnet-host-tests"
+path = "main.rs"

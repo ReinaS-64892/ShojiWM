@@ -138,35 +138,13 @@ Test("handler IDs cannot invoke another window's delegate", () =>
     Check(response.Ok && response.Invoked == false && response.Actions.Count == 0);
 });
 
-Test("NDJSON framing with Unicode, coalesced requests and clean EOF", () =>
-{
-    var request = Json(Request("evaluate", window: snapshot));
-    using var input = new MemoryStream(Encoding.UTF8.GetBytes(request + "\n{}\n"));
-    using var output = new MemoryStream();
-    var transport = new NdjsonTransport(input, output);
-    Check(transport.ReadFrame() == request && transport.ReadFrame() == "{}" && transport.ReadFrame() is null);
-    transport.WriteFrame(new() { RequestId = 123, Kind = "evaluate", Ok = true });
-    Check(Encoding.UTF8.GetString(output.ToArray()).EndsWith('\n'));
-    Check(Parse<ExternalRuntimeResponse>(Encoding.UTF8.GetString(output.ToArray())).RequestId == 123);
-});
+Test("native ABI JSON, buffer ownership, size guards and exception containment", () => NativeAbiTests.Run(typeof(ExampleConfig).Assembly.Location, Json(Request("evaluate", window: snapshot))));
 
 Test("config assembly loading shares API identity", () =>
 {
     var loader = new ConfigLoader(typeof(ExampleConfig).Assembly.Location);
     Check(loader.CreateConfig() is IWindowConfig);
     loader.Unload();
-});
-
-Test("transport rejects partial and oversized frames", () =>
-{
-    using var output = new MemoryStream();
-    foreach (var bytes in new[] { Encoding.UTF8.GetBytes("{}"), new byte[NdjsonTransport.MaxFrameBytes] })
-    {
-        using var input = new MemoryStream(bytes);
-        try { new NdjsonTransport(input, output).ReadFrame(); }
-        catch (InvalidDataException) { continue; }
-        throw new InvalidOperationException("invalid frame accepted");
-    }
 });
 
 Test("lifecycle enable/disable called exactly once per generation", () =>

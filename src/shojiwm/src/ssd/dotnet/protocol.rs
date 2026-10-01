@@ -1,5 +1,5 @@
-//! Semantic MVP protocol for an external runtime. Transport framing lives in
-//! `transport`; snapshots, props and actions reuse the existing serde DTOs.
+//! Semantic JSON protocol for the .NET bootstrap. ABI hosting lives in
+//! `host`; snapshots, props and actions reuse the existing serde DTOs.
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,7 @@ use super::super::evaluator::RuntimeWindowAction;
 use super::super::{WaylandOutputSnapshot, WaylandWindowSnapshot, WireDecorationNode};
 use crate::runtime_input::RuntimeInputDeviceSnapshot;
 
-/// Same camelCase vocabulary as the embedded runtime. Only the external
+/// Same camelCase vocabulary as the embedded runtime. Only the .NET
 /// backend serializes this envelope; V8's native requests remain native.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

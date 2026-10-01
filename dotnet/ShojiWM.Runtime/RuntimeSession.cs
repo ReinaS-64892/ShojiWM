@@ -3,8 +3,8 @@ using ShojiWM.Wire;
 
 namespace ShojiWM.Runtime;
 
-/// Semantic requests are independent of stdin/stdout framing. A future socket
-/// transport can call the same session. User callbacks never cross the wire.
+/// Semantic requests are independent of native hosting. Config callbacks stay
+/// managed; only handler IDs are returned to Rust.
 public sealed class RuntimeSession : IDisposable
 {
     private IWindowConfig? config;
