@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="ShojiWM.Example/ShojiWM.Example.csproj" />
+  <Project Path="ShojiWM.Runtime/ShojiWM.Runtime.csproj" />
+  <Project Path="ShojiWM.Tests/ShojiWM.Tests.csproj" />
+  <Project Path="ShojiWM/ShojiWM.csproj" />
+</Solution>
